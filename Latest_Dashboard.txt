@@ -1,0 +1,2230 @@
+USE [EZTBM_Local]
+GO
+/****** Object:  StoredProcedure [LocalTest2].[CIO_OverviewDashboard]    Script Date: 30-Apr-24 10:09:56 AM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+ALTER   PROCEDURE [LocalTest2].[CIO_OverviewDashboard]
+(
+	@Month INT,
+	@Year INT,
+	@CostCenterIds NVARCHAR(MAX) = NULL,
+	@CostCenterOwner NVARCHAR(MAX)= NULL,
+	@RegionIds NVARCHAR(MAX)= NULL,
+	@LocationIds NVARCHAR(MAX)= NULL,
+	@DepartmentIds NVARCHAR(MAX)= NULL,
+	@OfficeIds NVARCHAR(MAX)= NULL,
+	@CountryIds NVARCHAR(MAX)= NULL,
+	@FinanceCostCategoryIds NVARCHAR(MAX)= NULL,
+	@ExpenseTypeIds NVARCHAR(MAX)= NULL,
+	@BusinessUnitIds NVARCHAR(MAX)= NULL,
+	@UserId INT = 1,
+	@IsBudget bit = 1,
+	@ForcastId INT = NULL,
+	@CostCenterVersionIds NVARCHAR(MAX) = NULL
+)
+AS
+BEGIN
+
+	SET NOCOUNT ON;
+
+	--====================== Enum/Default Value ============================================================	
+	DECLARE @Enum_CapExId TINYINT= (SELECT [dbo].[fnGetEnumVal]('CostClassification_CapEx'))
+	DECLARE @Enum_OpExId TINYINT= (SELECT [dbo].[fnGetEnumVal]('CostClassification_OpEx'))
+	DECLARE	@ItPortfolioEntityType_Service INT=(SELECT dbo.fnGetEnumVal('ItPortfolioEntityType_Service'))
+	DECLARE	@ItPortfolioEntityType_Application INT=(SELECT dbo.fnGetEnumVal('ItPortfolioEntityType_Application'))
+	DECLARE	@UnallocatedServiceId INT=(SELECT dbo.fnGetDefaultValue('UnallocatedService'))
+	DECLARE @DashboardId INT= (SELECT Id FROM AppDashboardMaster ad WHERE ParentId = 0 AND Name = 'CIODashboard')  --6
+	DECLARE @TabId INT= (SELECT Id FROM AppDashboardMaster ad WHERE Name = 'Overview' AND ad.ParentId = @DashboardId)  --369
+	--====================== Enum/Default Value ============================================================
+
+	--====================== Exclude Finance Cost Category For Showing Correct Finance Category % ============================================================	
+	DECLARE @ExcludeFinanceCostCategoryParentName NVARCHAR(17) = 'Internal Services'
+	DECLARE @ExcludeFinanceCostCategory NVARCHAR(19) = 'Cross Charges - OUT'
+	DECLARE @ExcludeFinanceCostCategoryId INT = ISNULL((SELECT Id FROM AppCostCategories WHERE ParentId = (SELECT Id FROM AppCostCategories WHERE CostCategoryName = @ExcludeFinanceCostCategoryParentName) AND CostCategoryName = @ExcludeFinanceCostCategory),0)
+	--====================== Exclude Finance Cost Category For Showing Correct Finance Category % ============================================================	
+
+	DECLARE	@UnderBudgetPct DECIMAL(18,2)=(SELECT Value FROM AppCompanyProfile WHERE Name = 'UnderBudgetPercentage')
+	DECLARE	@OverBudgetPct DECIMAL(18,2)=(SELECT Value FROM AppCompanyProfile WHERE Name = 'OverBudgetPercentage')
+	DECLARE	@FiscalStartMonth INT 
+	DECLARE @FiscalYear INT 
+	DECLARE @FiscalEndMonth INT 
+	SELECT @FiscalYear = FiscalYear, @FiscalStartMonth = StartMonth,@FiscalEndMonth = MONTH(EndDate) FROM AppFiscalYears WHERE DATEFROMPARTS(@Year,@Month,1) Between StartDate And EndDate 
+	DECLARE @AccountPeriod INT = [dbo].[fnGetAccountingPeriod](@FiscalStartMonth,@Month)
+	DECLARE @InternalLaborCategoryId INT= (SELECT Id FROM AppCostCategories WHERE Category = 1 AND LOWER(CostCategoryName) = LOWER('Internal Labor') AND ParentId IS NULL)
+	DECLARE @ExternalLaborCategoryId INT=(SELECT Id FROM AppCostCategories WHERE Category = 1 AND LOWER(CostCategoryName) = LOWER('External Labor') AND ParentId IS NULL)
+	DECLARE @IsDisable INT 
+
+	
+	DECLARE @TDashboardConfig TABLE ( Id INT,Name NVARCHAR(256),IsDisable INT )
+	INSERT INTO @TDashboardConfig 
+	SELECT ad.Id,ad.Name,ISNULL(adc.UserId,0) AS IsDisable FROM AppDashboardMaster ad 
+	LEFT JOIN AppDashboardConfiguration adc ON ad.Id = adc.DashboardMasterId AND adc.UserId = @UserId
+	WHERE ad.ParentId = @TabId 
+	 
+
+	DECLARE @ITCost DECIMAL(18,2)
+	DECLARE	@ITCostYTD DECIMAL(18,2)
+	DECLARE @ITCostCapEx DECIMAL(18,2)
+	DECLARE	@ITCostCapExYTD DECIMAL(18,2)
+	DECLARE	@ITBudgetOpEx DECIMAL(18,2)
+	DECLARE	@ITBudgetOpExYTD DECIMAL(18,2)
+	DECLARE	@ITBudgetCapEx DECIMAL(18,2)
+	DECLARE	@ITBudgetCapExYTD DECIMAL(18,2)
+	DECLARE @LaborOpExYTD DECIMAL(18,2)
+	DECLARE @LaborOpExITCostYTD DECIMAL(18,2)
+	DECLARE @LaborITCostPctYTD DECIMAL(18,4)
+	DECLARE @VendorsOpExYTD DECIMAL(18,2)
+	DECLARE @VendorsITCostPctYTD DECIMAL(18,4)
+	DECLARE @ITSpend DECIMAL(18,2)
+	DECLARE @ITRevenue DECIMAL(18,2)
+	DECLARE @ITSpendVRevenue NVARCHAR(256)	
+	DECLARE @ITSpendRevenueChart NVARCHAR(MAX)
+	DECLARE	@CapExOpEx NVARCHAR(256)
+	DECLARE @ITCostToPlan NVARCHAR(2048)
+	DECLARE @Top10CostCenterOpEx NVARCHAR(MAX)
+	DECLARE @CostByBusinessUnitYTD NVARCHAR(MAX)
+	DECLARE	@ServicesData NVARCHAR(512)
+	DECLARE	@ProjectsData NVARCHAR(512)
+	DECLARE	@ApplicationsData NVARCHAR(512)
+	DECLARE @ServiceApplicationProjectChartData NVARCHAR(MAX)
+	DECLARE @ProjectsTrend NVARCHAR(MAX)
+	DECLARE @Top5ServicesCostChart NVARCHAR(MAX)
+	DECLARE @Top5ApplicationsCostChart NVARCHAR(MAX)
+	DECLARE @Top5ProjectsCostChart NVARCHAR(MAX)
+	DECLARE @RGTCostChart NVARCHAR(MAX)
+	DECLARE @ProjectCostChart NVARCHAR(MAX)
+	DECLARE @ServiceCostChart NVARCHAR(MAX)
+	DECLARE @ApplicationCostChart NVARCHAR(MAX)
+	DECLARE @ITCostToPlanFY NVARCHAR(MAX)
+	DECLARE @ITCostWaterfall NVARCHAR(MAX)
+	--DECLARE @TempCostWaterfall TABLE (ID INT IDENTITY(1,1),MonthYear NVARCHAR(256),Amount DECIMAL(18,2))
+
+	Create Table #TempCostWaterfall(ID INT IDENTITY(1,1),MonthYear NVARCHAR(256),Amount DECIMAL(18,2))
+
+	DECLARE @ITVarianceOpExYTD DECIMAL(18,2)
+	DECLARE @ITVarianceOpExYTDPct DECIMAL(18,4)
+    DECLARE	@ITVarianceOpExYTDEffect NVARCHAR(256)
+	DECLARE @ITVarianceCapExYTD DECIMAL(18,2)
+	DECLARE @ITVarianceCapExYTDPct DECIMAL(18,4)
+    DECLARE	@ITVarianceCapExYTDEffect NVARCHAR(256)
+
+	DECLARE @TempOverview TABLE
+	(
+		Id INT IDENTITY(1,1),
+		ITCost NVARCHAR(256),
+		ITCostYTD NVARCHAR(256),
+		ITCostCapEx NVARCHAR(256),
+		ITCostCapExYTD NVARCHAR(256),
+		ITBudgetOpExYTD NVARCHAR(256),
+		ITBudgetCapExYTD NVARCHAR(256),
+		LaborITCostPctYTD NVARCHAR(256),
+		VendorsITCostPctYTD NVARCHAR(256),
+		ITSpend DECIMAL(18,2),
+		ITRevenue DECIMAL(18,2),
+		ITSpendVRevenue NVARCHAR(256),
+		ITSpendRevenueChart NVARCHAR(MAX),
+		CapExOpEx NVARCHAR(256),
+		ITCostToPlan NVARCHAR(2048),
+		Top10CostCenterOpEx NVARCHAR(MAX),
+		CostByBusinessUnitYTD NVARCHAR(MAX),
+		ServicesData NVARCHAR(512),
+		ProjectsData  NVARCHAR(512), 
+		ApplicationsData NVARCHAR(512),
+		ServiceApplicationProjectChartData NVARCHAR(MAX),
+		ProjectsTrend NVARCHAR(MAX),
+		Top5ServicesCostChart NVARCHAR(MAX),
+		Top5ApplicationsCostChart NVARCHAR(MAX),
+		Top5ProjectsCostChart NVARCHAR(MAX),
+		RGTCostChart NVARCHAR(MAX),
+		ITCostToPlanFY NVARCHAR(MAX),
+		ITCostWaterfall NVARCHAR(MAX),
+		LaborOpExYTD NVARCHAR(MAX),
+		LaborOpExITCostYTD NVARCHAR(MAX),
+		ITBudgetOpEx NVARCHAR(256),
+		ITBudgetCapEx NVARCHAR(256),
+		ITVarianceOpExYTD NVARCHAR(256),
+		ITVarianceOpExYTDPct NVARCHAR(256),
+		ITVarianceOpExYTDEffect NVARCHAR(256),
+		ITVarianceCapExYTD NVARCHAR(256),
+		ITVarianceCapExYTDPct NVARCHAR(256),
+		ITVarianceCapExYTDEffect NVARCHAR(256)
+	)
+	
+	-----------------------------------------------------------------------------------------------
+	--IT Cost (OpEx)
+	-----------------------------------------------------------------------------------------------
+   	-- For CostCenterIds 
+	CREATE TABLE #cc_Ids(Item  int)
+	If(@CostCenterIds Is Not null)
+	BEGIN
+	  Insert into #cc_Ids(Item)
+	  SELECT * FROM dbo.fnStringToInts(@CostCenterIds)
+	END
+
+	-- For CostCenterOwner
+	CREATE TABLE #cc_Owner(Item NVARCHAR(256))
+	If(@CostCenterOwner Is Not null)
+	BEGIN
+	    Insert Into #cc_Owner(Item)
+	    SELECT * FROM dbo.fnStringSplitComma(@CostCenterOwner)
+	END
+
+     --  For RegionIds
+    CREATE TABLE #region_Ids(Item  int)
+	If(@RegionIds Is Not null)
+	BEGIN
+	  Insert into #region_Ids(Item)
+	  SELECT * FROM dbo.fnStringToInts(@RegionIds)
+	END
+
+	--For LocationIds
+    CREATE TABLE #location_Ids(Item  int)
+	If(@LocationIds Is Not null)
+	BEGIN
+	  Insert into #location_Ids(Item)
+	  SELECT * FROM dbo.fnStringToInts(@LocationIds)
+	END
+
+	--For DepartmentIds
+    CREATE TABLE #department_Ids(Item  int)
+	If(@DepartmentIds Is Not null)
+	BEGIN
+	  Insert into #department_Ids(Item)
+	  SELECT * FROM dbo.fnStringToInts(@DepartmentIds)
+	END
+
+	--For OfficeIds
+    CREATE TABLE #office_Ids(Item  int)
+	If(@OfficeIds Is Not null)
+	BEGIN
+	  Insert into #office_Ids(Item)
+	  SELECT * FROM dbo.fnStringToInts(@OfficeIds)
+	END
+
+	--For CountryIds
+    CREATE TABLE #country_Ids(Item  int)
+	If(@CountryIds Is Not null)
+	BEGIN
+	  Insert into #country_Ids(Item)
+	  SELECT * FROM dbo.fnStringToInts(@CountryIds)
+	END
+
+	--For FinanceCostCategoryIds
+    CREATE TABLE #financeCostCategory_Ids(Item  int)
+	If(@FinanceCostCategoryIds Is Not null)
+	BEGIN
+	  Insert into #financeCostCategory_Ids(Item)
+	  SELECT * FROM dbo.fnStringToInts(@FinanceCostCategoryIds)
+	END
+
+	-- For ExpenseTypeIds
+    CREATE TABLE #expenseType_Ids(Item NVARCHAR(256))
+	If(@ExpenseTypeIds Is Not null)
+	BEGIN
+	  Insert into #expenseType_Ids(Item)
+	  SELECT * FROM dbo.fnStringSplitComma(@ExpenseTypeIds)
+	END
+
+	--For BusinessUnitIds
+    CREATE TABLE #businessUnit_Ids(Item  int)
+	If(@BusinessUnitIds Is Not null)
+	BEGIN
+	  Insert into #businessUnit_Ids(Item)
+	  SELECT * FROM dbo.fnStringToInts(@BusinessUnitIds)
+	END
+
+	--For CostCenterVersionIds
+    CREATE TABLE #costCenterVersion_Ids(Item  int)
+	If(@CostCenterVersionIds Is Not null)
+	BEGIN
+	  Insert into #costCenterVersion_Ids(Item)
+	  SELECT * FROM dbo.fnStringToInts(@CostCenterVersionIds)
+	END
+
+
+	SET @IsDisable = (SELECT IsDisable FROM @TDashboardConfig WHERE Name = 'ITCostOpEx')
+	IF(@IsDisable = 0)
+	BEGIN		
+	-----------------------------------------------------------------------------------------------
+	--IT Cost 
+	-----------------------------------------------------------------------------------------------
+
+			DECLARE @IT_cost NVARCHAR(MAX);
+	        SET @IT_cost = '
+                SELECT @ITCost =  ISNULL(SUM(ISNULL(appExp.ExpenseAmount,0)),0)    
+                FROM vw_ExpensesLight appExp 
+                WHERE appExp.CostClassificationIDCapExOpEx = @Enum_OpExId 
+                AND appExp.[Month] = @Month AND appExp.[Year] = @Year';
+
+	           IF (@CostCenterIds IS NOT NULL)      
+               SET @IT_cost = @IT_cost + ' AND appExp.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+               
+			   If(@CostCenterOwner Is Not NUll)
+			   SET @IT_cost = @IT_cost + ' AND appExp.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+			   
+			   IF(@RegionIds Is not null)
+			   SET @IT_cost = @IT_cost + ' AND appExp.RegionId IN (SELECT Item FROM #region_Ids)';
+			   	   
+			   IF(@LocationIds Is not null)
+			   SET @IT_cost = @IT_cost + ' AND appExp.LocationId IN (SELECT Item FROM #location_Ids)';
+			   
+			   IF(@DepartmentIds Is not null)
+			   SET @IT_cost = @IT_cost + ' AND appExp.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+			   IF(@OfficeIds Is not null)
+			   SET @IT_cost = @IT_cost + ' AND appExp.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+			   IF(@CountryIds Is not null)
+			   SET @IT_cost = @IT_cost + ' AND appExp.CountryId IN (SELECT Item FROM #country_Ids)';
+
+		       IF (@FinanceCostCategoryIds IS NOT NULL)
+               SET @IT_cost = @IT_cost + ' AND (appExp.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = appExp.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids))';
+
+			   IF(@ExpenseTypeIds Is not null)
+			   SET @IT_cost = @IT_cost + ' AND appExp.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+			   IF(@BusinessUnitIds Is not null)
+			   SET @IT_cost = @IT_cost + ' AND appExp.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+               EXEC sp_executesql @IT_cost, N'@Enum_OpExId INT, @Month INT, @Year INT, @ITCost DECIMAL OUTPUT', @Enum_OpExId, @Month, @Year, @ITCost OUTPUT;
+
+	-----------------------------------------------------------------------------------------------
+	--IT Budget OpEx
+	-----------------------------------------------------------------------------------------------
+
+			 DECLARE @IT_BudgetOpEx NVARCHAR(MAX);
+             SET @IT_BudgetOpEx = '
+                   SELECT @ITBudgetOpEx = 
+                   CASE WHEN @IsBudget = 1 THEN
+                   (
+                   SELECT ISNULL(SUM(vb.Amount), 0) 
+                   FROM vw_BudgetPlanDetails vb
+                    WHERE vb.FiscalYear = @FiscalYear AND vb.CapExOpEx = @Enum_OpExId 
+                    AND [Month] = @Month';
+
+				   
+                     IF (@CostCenterIds IS NOT NULL)      
+                     SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' AND vb.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+
+                     IF (@CostCenterOwner IS NOT NULL)
+                     SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' AND vb.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+
+                    IF (@RegionIds IS NOT NULL)
+                    SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' AND vb.RegionId IN (SELECT Item FROM #region_Ids)';
+
+                    IF (@LocationIds IS NOT NULL)
+                    SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' AND vb.LocationId IN (SELECT Item FROM #location_Ids)';
+
+                    IF (@DepartmentIds IS NOT NULL)
+                    SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' AND vb.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+                   IF (@OfficeIds IS NOT NULL)
+                   SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' AND vb.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+                   IF (@CountryIds IS NOT NULL)
+                  SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' AND vb.CountryId IN (SELECT Item FROM #country_Ids)';
+
+                 IF (@FinanceCostCategoryIds IS NOT NULL)
+                  SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' AND (vb.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids)
+                  OR ((SELECT ParentId FROM vw_CostCategories WHERE Id = vb.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids)))';
+
+                 IF (@ExpenseTypeIds IS NOT NULL)
+                 SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' AND vb.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+                  IF (@BusinessUnitIds IS NOT NULL)
+                  SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' AND vb.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+
+				 SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' )
+                      ELSE
+                      (
+                 SELECT ISNULL(SUM(vb.Amount), 0) 
+                 FROM vw_BudgetForecastingDetails vb
+                 WHERE vb.FiscalYear = @FiscalYear AND vb.CapExOpEx = @Enum_OpExId 
+                 AND vb.ForecastingId = @ForcastId
+                 AND [Month] = @Month ';
+
+				     IF (@CostCenterIds IS NOT NULL)      
+                     SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' AND vb.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+
+                     IF (@CostCenterOwner IS NOT NULL)
+                     SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' AND vb.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+
+                     IF (@RegionIds IS NOT NULL)
+                     SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' AND vb.RegionId IN (SELECT Item FROM #region_Ids)';
+
+                     IF (@LocationIds IS NOT NULL)
+                     SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' AND vb.LocationId IN (SELECT Item FROM #location_Ids)';
+
+                     IF (@DepartmentIds IS NOT NULL)
+                     SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' AND vb.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+                     IF (@OfficeIds IS NOT NULL)
+                     SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' AND vb.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+                     IF (@CountryIds IS NOT NULL)
+                     SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' AND vb.CountryId IN (SELECT Item FROM #country_Ids)';
+
+                      IF (@FinanceCostCategoryIds IS NOT NULL)
+                      SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' AND vb.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = vb.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids)';
+  
+                      IF (@ExpenseTypeIds IS NOT NULL)
+                      SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' AND vb.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+			       	IF (@CostCenterVersionIds IS NOT NULL)
+                     SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' ( (NULLIF(@CostCenterVersionIds, '') IS NULL AND vb.IsLatestVersion = 1)
+                     OR (NULLIF(@CostCenterVersionIds, '') IS NOT NULL AND vb.ForecastingCostCenterId IN (SELECT Item FROM #costCenterVersion_Ids)))'; 
+
+                    SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' )';
+				    SET @IT_BudgetOpEx = @IT_BudgetOpEx + ' END';
+
+                   EXEC sp_executesql @IT_BudgetOpEx, N'@Enum_OpExId INT, @ForcastId INT, @Month INT, @FiscalYear INT,@IsBudget bit ,@ITBudgetOpEx DECIMAL OUTPUT', 
+                   @Enum_OpExId, @ForcastId, @Month, @FiscalYear,@IsBudget,  @ITBudgetOpEx OUTPUT;	
+	END
+	
+	-----------------------------------------------------------------------------------------------
+	--IT Cost OpEx (YTD)
+	-----------------------------------------------------------------------------------------------
+	SET @IsDisable = (SELECT IsDisable FROM @TDashboardConfig WHERE Name = 'ITCostOpExYTD')
+	IF(@IsDisable = 0)
+	BEGIN
+
+				DECLARE @IT_costYTD NVARCHAR(MAX);
+				set @IT_costYTD = 'SELECT @ITCostYTD  = ISNULL(SUM(ISNULL(appExp.ExpenseAmount,0)),0) 
+		    	FROM vw_ExpensesLight appExp 
+		    	WHERE appExp.CostClassificationIDCapExOpEx = @Enum_OpExId 
+				AND appExp.[Month] IN (SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth,@Month)) 
+				AND appExp.FiscalYear = @FiscalYear '
+
+				 IF (@CostCenterIds IS NOT NULL)      
+               SET @IT_costYTD = @IT_costYTD + ' AND appExp.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+               
+			   If(@CostCenterOwner Is Not NUll)
+			   SET @IT_costYTD = @IT_costYTD + ' AND appExp.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+			   
+			   IF(@RegionIds Is not null)
+			   SET @IT_costYTD = @IT_costYTD + ' AND appExp.RegionId IN (SELECT Item FROM #region_Ids)';
+			   	   
+			   IF(@LocationIds Is not null)
+			   SET @IT_costYTD = @IT_costYTD + ' AND appExp.LocationId IN (SELECT Item FROM #location_Ids)';
+			   
+			   IF(@DepartmentIds Is not null)
+			   SET @IT_costYTD = @IT_costYTD + ' AND appExp.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+			   IF(@OfficeIds Is not null)
+			   SET @IT_costYTD = @IT_costYTD + ' AND appExp.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+			   IF(@CountryIds Is not null)
+			   SET @IT_costYTD = @IT_costYTD + ' AND appExp.CountryId IN (SELECT Item FROM #country_Ids)';
+
+		       IF (@FinanceCostCategoryIds IS NOT NULL)
+               SET @IT_costYTD = @IT_costYTD + ' AND (appExp.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = appExp.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids))';
+
+			   IF(@ExpenseTypeIds Is not null)
+			   SET @IT_costYTD = @IT_costYTD + ' AND appExp.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+			   IF(@BusinessUnitIds Is not null)
+			   SET @IT_costYTD = @IT_costYTD + ' AND appExp.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+			   EXEC sp_executesql @IT_costYTD, N'@Enum_OpExId INT,@Month Int, @FiscalStartMonth Int , @FiscalYear INT, @ITCostYTD DECIMAL OUTPUT', @Enum_OpExId, @Month ,  @FiscalStartMonth , @FiscalYear, @ITCostYTD OUTPUT;
+
+	-------------------------------------------------------------------------------------------------
+	--IT Budget OpEx YTD
+	-------------------------------------------------------------------------------------------------
+
+		DECLARE @IT_BudgetOpExYTD NVARCHAR(MAX);
+		set @IT_BudgetOpExYTD  =  'SELECT @ITBudgetOpExYTD =
+			CASE WHEN @IsBudget = 1 THEN
+			(	SELECT  ISNULL(SUM(vb.Amount),0) 
+				FROM vw_BudgetPlanDetails vb
+				WHERE vb.FiscalYear = @FiscalYear AND vb.CapExOpEx = @Enum_OpExId 
+					AND [Month] IN (SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth,@Month))'
+
+
+                  IF (@CostCenterIds IS NOT NULL)      
+                     SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' AND vb.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+
+                     IF (@CostCenterOwner IS NOT NULL)
+                     SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' AND vb.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+
+                    IF (@RegionIds IS NOT NULL)
+                    SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' AND vb.RegionId IN (SELECT Item FROM #region_Ids)';
+
+                    IF (@LocationIds IS NOT NULL)
+                    SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' AND vb.LocationId IN (SELECT Item FROM #location_Ids)';
+
+                    IF (@DepartmentIds IS NOT NULL)
+                    SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' AND vb.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+                   IF (@OfficeIds IS NOT NULL)
+                   SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' AND vb.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+                   IF (@CountryIds IS NOT NULL)
+                  SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' AND vb.CountryId IN (SELECT Item FROM #country_Ids)';
+
+                  IF (@FinanceCostCategoryIds IS NOT NULL)
+                  SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' AND (vb.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids)
+                  OR ((SELECT ParentId FROM vw_CostCategories WHERE Id = vb.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids)))';
+
+                 IF (@ExpenseTypeIds IS NOT NULL)
+                 SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' AND vb.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+                  IF (@BusinessUnitIds IS NOT NULL)
+                  SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' AND vb.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+				   SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' )
+                      ELSE
+                      (
+                    SELECT  ISNULL(SUM(vb.Amount),0) 
+			    	FROM vw_BudgetForecastingDetails vb
+			    	WHERE vb.FiscalYear = @FiscalYear AND vb.CapExOpEx = @Enum_OpExId 
+					AND vb.ForecastingId = @ForcastId
+					AND [Month] IN (SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth,@Month)) ';
+
+				     IF (@CostCenterIds IS NOT NULL)      
+                     SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' AND vb.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+
+                     IF (@CostCenterOwner IS NOT NULL)
+                     SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' AND vb.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+
+                     IF (@RegionIds IS NOT NULL)
+                     SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' AND vb.RegionId IN (SELECT Item FROM #region_Ids)';
+
+                     IF (@LocationIds IS NOT NULL)
+                     SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' AND vb.LocationId IN (SELECT Item FROM #location_Ids)';
+
+                     IF (@DepartmentIds IS NOT NULL)
+                     SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' AND vb.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+                     IF (@OfficeIds IS NOT NULL)
+                     SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' AND vb.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+                     IF (@CountryIds IS NOT NULL)
+                     SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' AND vb.CountryId IN (SELECT Item FROM #country_Ids)';
+
+                      IF (@FinanceCostCategoryIds IS NOT NULL)
+                      SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' AND vb.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = vb.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids)';
+  
+                      IF (@ExpenseTypeIds IS NOT NULL)
+                      SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' AND vb.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+			    	IF (@CostCenterVersionIds IS NOT NULL)
+                    SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' ( (NULLIF(@CostCenterVersionIds, '') IS NULL AND vb.IsLatestVersion = 1)
+                    OR (NULLIF(@CostCenterVersionIds, '') IS NOT NULL AND vb.ForecastingCostCenterId IN (SELECT Item FROM #costCenterVersion_Ids)))'; 
+
+                    SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' )';
+				    SET @IT_BudgetOpExYTD = @IT_BudgetOpExYTD + ' END';
+
+
+			   EXEC sp_executesql @IT_BudgetOpExYTD, N'@Enum_OpExId INT,@IsBudget bit , @ForcastId int ,  @Month Int, @FiscalStartMonth Int , @FiscalYear INT, @ITBudgetOpExYTD DECIMAL OUTPUT', @Enum_OpExId,@IsBudget ,@ForcastId ,  @Month ,  @FiscalStartMonth , @FiscalYear, @ITBudgetOpExYTD OUTPUT;
+
+	END
+
+	-----------------------------------------------------------------------------------------------
+	--IT Cost (CapEx)
+	-----------------------------------------------------------------------------------------------
+	SET @IsDisable = (SELECT IsDisable FROM @TDashboardConfig WHERE Name = 'ITCostCapEx')
+	IF(@IsDisable = 0)
+	BEGIN
+	
+				DECLARE @IT_CostCapEx NVARCHAR(MAX);
+				set @IT_CostCapEx = 'SELECT @ITCostCapEx = ISNULL(SUM(ISNULL(appCap.Amount,0)),0) 
+		    	FROM vw_CapExLight appCap 
+			    WHERE appCap.CapExOpEx = @Enum_CapExId 
+				AND appCap.[Month] = @Month AND appCap.[Year] = @Year '
+
+				
+	           IF (@CostCenterIds IS NOT NULL)      
+               SET @IT_CostCapEx = @IT_CostCapEx + ' AND appCap.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+               
+			   If(@CostCenterOwner Is Not NUll)
+			   SET @IT_CostCapEx = @IT_CostCapEx + ' AND appCap.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+			   
+			   IF(@RegionIds Is not null)
+			   SET @IT_CostCapEx = @IT_CostCapEx + ' AND appCap.RegionId IN (SELECT Item FROM #region_Ids)';
+			   	   
+			   IF(@LocationIds Is not null)
+			   SET @IT_CostCapEx = @IT_CostCapEx + ' AND appCap.LocationId IN (SELECT Item FROM #location_Ids)';
+			   
+			   IF(@DepartmentIds Is not null)
+			   SET @IT_CostCapEx = @IT_CostCapEx + ' AND appCap.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+			   IF(@OfficeIds Is not null)
+			   SET @IT_CostCapEx = @IT_CostCapEx + ' AND appCap.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+			   IF(@CountryIds Is not null)
+			   SET @IT_CostCapEx = @IT_CostCapEx + ' AND appCap.CountryId IN (SELECT Item FROM #country_Ids)';
+
+		      IF (@FinanceCostCategoryIds IS NOT NULL)
+              SET @IT_CostCapEx = @IT_CostCapEx + ' AND (appCap.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = appCap.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids))';
+
+			   IF(@ExpenseTypeIds Is not null)
+			   SET @IT_CostCapEx = @IT_CostCapEx + ' AND appCap.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+			   IF(@BusinessUnitIds Is not null)
+			   SET @IT_CostCapEx = @IT_CostCapEx + ' AND appCap.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+              EXEC sp_executesql @IT_CostCapEx, N'@Enum_CapExId INT, @Month INT, @Year INT, @ITCostCapEx DECIMAL OUTPUT', @Enum_CapExId, @Month, @Year, @ITCostCapEx OUTPUT;
+
+
+	
+	-----------------------------------------------------------------------------------------------
+	--IT Budget CapEx
+	-----------------------------------------------------------------------------------------------
+
+		DECLARE @IT_BudgetCapEx NVARCHAR(MAX);
+		set @IT_BudgetCapEx = 'SELECT @ITBudgetCapEx = 
+		CASE WHEN @IsBudget = 1 THEN
+		(	SELECT  ISNULL(SUM(vb.Amount),0) 
+			FROM vw_BudgetPlanDetails vb
+			WHERE vb.FiscalYear = @FiscalYear AND vb.CapExOpEx = @Enum_CapExId
+				AND [Month] = @Month '
+
+
+                     IF (@CostCenterIds IS NOT NULL)      
+                     SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' AND vb.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+
+                     IF (@CostCenterOwner IS NOT NULL)
+                     SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' AND vb.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+
+                     IF (@RegionIds IS NOT NULL)
+                     SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' AND vb.RegionId IN (SELECT Item FROM #region_Ids)';
+
+                      IF (@LocationIds IS NOT NULL)
+                     SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' AND vb.LocationId IN (SELECT Item FROM #location_Ids)';
+
+                      IF (@DepartmentIds IS NOT NULL)
+                      SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' AND vb.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+                     IF (@OfficeIds IS NOT NULL)
+                     SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' AND vb.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+                   IF (@CountryIds IS NOT NULL)
+                  SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' AND vb.CountryId IN (SELECT Item FROM #country_Ids)';
+
+                 IF (@FinanceCostCategoryIds IS NOT NULL)
+                  SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' AND (vb.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids)
+                  OR ((SELECT ParentId FROM vw_CostCategories WHERE Id = vb.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids)))';
+
+                 IF (@ExpenseTypeIds IS NOT NULL)
+                 SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' AND vb.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+                  IF (@BusinessUnitIds IS NOT NULL)
+                  SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' AND vb.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+
+				 SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' )
+                      ELSE
+                      (
+                SELECT  ISNULL(SUM(vb.Amount),0) 
+			    FROM vw_BudgetForecastingDetails vb
+		    	WHERE vb.FiscalYear = @FiscalYear AND vb.CapExOpEx = @Enum_CapExId
+				AND vb.ForecastingId = @ForcastId
+				AND [Month] = @Month  ';
+
+				     IF (@CostCenterIds IS NOT NULL)      
+                     SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' AND vb.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+
+                     IF (@CostCenterOwner IS NOT NULL)
+                     SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' AND vb.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+
+                     IF (@RegionIds IS NOT NULL)
+                     SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' AND vb.RegionId IN (SELECT Item FROM #region_Ids)';
+
+                     IF (@LocationIds IS NOT NULL)
+                     SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' AND vb.LocationId IN (SELECT Item FROM #location_Ids)';
+
+                     IF (@DepartmentIds IS NOT NULL)
+                     SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' AND vb.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+                     IF (@OfficeIds IS NOT NULL)
+                     SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' AND vb.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+                     IF (@CountryIds IS NOT NULL)
+                     SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' AND vb.CountryId IN (SELECT Item FROM #country_Ids)';
+
+                      IF (@FinanceCostCategoryIds IS NOT NULL)
+                      SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' AND vb.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = vb.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids)';
+  
+                      IF (@ExpenseTypeIds IS NOT NULL)
+                      SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' AND vb.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+			    	IF (@CostCenterVersionIds IS NOT NULL)
+                    SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' ( (NULLIF(@CostCenterVersionIds, '') IS NULL AND vb.IsLatestVersion = 1)
+                    OR (NULLIF(@CostCenterVersionIds, '') IS NOT NULL AND vb.ForecastingCostCenterId IN (SELECT Item FROM #costCenterVersion_Ids)))'; -- Here add a closing parenthesis
+
+                    SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' )';
+				    SET @IT_BudgetCapEx = @IT_BudgetCapEx + ' END';
+
+                   EXEC sp_executesql @IT_BudgetCapEx, N'@Enum_CapExId INT, @ForcastId INT, @Month INT, @FiscalYear INT,@IsBudget bit ,@ITBudgetCapEx DECIMAL OUTPUT', 
+                   @Enum_CapExId, @ForcastId, @Month, @FiscalYear,@IsBudget,  @ITBudgetCapEx OUTPUT;
+
+	END
+	
+	-----------------------------------------------------------------------------------------------
+	--IT Cost CapEx (YTD)
+	-----------------------------------------------------------------------------------------------
+	SET @IsDisable = (SELECT IsDisable FROM @TDashboardConfig WHERE Name = 'ITCostCapExYTD')
+	IF(@IsDisable = 0)
+	BEGIN
+
+					DECLARE @IT_CostCapExYTD NVARCHAR(MAX);
+					set  @IT_CostCapExYTD =  'SELECT @ITCostCapExYTD =  ISNULL(SUM(ISNULL(appCap.Amount,0)),0) 
+			FROM vw_CapExLight appCap
+			WHERE appCap.CapExOpEx = @Enum_CapExId 
+				AND appCap.[Month] IN (SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth,@Month)) 
+				AND appCap.FiscalYear = @FiscalYear '
+
+				 IF (@CostCenterIds IS NOT NULL)      
+               SET @IT_CostCapExYTD = @IT_CostCapExYTD + ' AND appCap.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+               
+			   If(@CostCenterOwner Is Not NUll)
+			   SET @IT_CostCapExYTD = @IT_CostCapExYTD + ' AND appCap.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+			   
+			   IF(@RegionIds Is not null)
+			   SET @IT_CostCapExYTD = @IT_CostCapExYTD + ' AND appCap.RegionId IN (SELECT Item FROM #region_Ids)';
+			   	   
+			   IF(@LocationIds Is not null)
+			   SET @IT_CostCapExYTD = @IT_CostCapExYTD + ' AND appCap.LocationId IN (SELECT Item FROM #location_Ids)';
+			   
+			   IF(@DepartmentIds Is not null)
+			   SET @IT_CostCapExYTD = @IT_CostCapExYTD + ' AND appCap.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+			   IF(@OfficeIds Is not null)
+			   SET @IT_CostCapExYTD = @IT_CostCapExYTD + ' AND appCap.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+			   IF(@CountryIds Is not null)
+			   SET @IT_CostCapExYTD = @IT_CostCapExYTD + ' AND appCap.CountryId IN (SELECT Item FROM #country_Ids)';
+
+		      IF (@FinanceCostCategoryIds IS NOT NULL)
+              SET @IT_CostCapExYTD = @IT_CostCapExYTD + ' AND (appCap.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = appCap.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids))';
+
+			   IF(@ExpenseTypeIds Is not null)
+			   SET @IT_CostCapExYTD = @IT_CostCapExYTD + ' AND appCap.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+			   IF(@BusinessUnitIds Is not null)
+			   SET @IT_CostCapExYTD = @IT_CostCapExYTD + ' AND appCap.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+			   EXEC sp_executesql @IT_CostCapExYTD, N'@Enum_CapExId INT,@Month Int, @FiscalStartMonth Int , @FiscalYear INT, @ITCostCapExYTD DECIMAL OUTPUT', @Enum_CapExId, @Month ,  @FiscalStartMonth , @FiscalYear, @ITCostCapExYTD OUTPUT;
+
+
+	-----------------------------------------------------------------------------------------------
+	--IT Budget CapEx YTD
+	-----------------------------------------------------------------------------------------------
+
+		DECLARE @IT_BudgetCapExYTD NVARCHAR(MAX);
+		set @IT_BudgetCapExYTD =  'SELECT @ITBudgetCapExYTD = 
+		CASE WHEN @IsBudget = 1 THEN
+		(	SELECT  ISNULL(SUM(vb.Amount),0) 
+			FROM vw_BudgetPlanDetails vb
+			WHERE vb.FiscalYear = @FiscalYear AND vb.CapExOpEx = @Enum_CapExId
+				AND [Month] IN (SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth,@Month))'
+
+				
+                  IF (@CostCenterIds IS NOT NULL)      
+                     SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' AND vb.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+
+                     IF (@CostCenterOwner IS NOT NULL)
+                     SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' AND vb.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+
+                    IF (@RegionIds IS NOT NULL)
+                    SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' AND vb.RegionId IN (SELECT Item FROM #region_Ids)';
+
+                    IF (@LocationIds IS NOT NULL)
+                    SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' AND vb.LocationId IN (SELECT Item FROM #location_Ids)';
+
+                    IF (@DepartmentIds IS NOT NULL)
+                    SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' AND vb.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+                   IF (@OfficeIds IS NOT NULL)
+                   SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' AND vb.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+                   IF (@CountryIds IS NOT NULL)
+                  SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' AND vb.CountryId IN (SELECT Item FROM #country_Ids)';
+
+                 IF (@FinanceCostCategoryIds IS NOT NULL)
+                  SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' AND (vb.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids)
+                  OR ((SELECT ParentId FROM vw_CostCategories WHERE Id = vb.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids)))';
+
+                 IF (@ExpenseTypeIds IS NOT NULL)
+                 SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' AND vb.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+                  IF (@BusinessUnitIds IS NOT NULL)
+                  SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' AND vb.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+				   SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' )
+                      ELSE
+                      (
+                SELECT  ISNULL(SUM(vb.Amount),0) 
+			    FROM vw_BudgetForecastingDetails vb
+		    	WHERE vb.FiscalYear = @FiscalYear AND vb.CapExOpEx = @Enum_CapExId
+				AND vb.ForecastingId = @ForcastId
+				AND [Month] IN (SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth,@Month)) ';
+
+				     IF (@CostCenterIds IS NOT NULL)      
+                     SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' AND vb.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+
+                     IF (@CostCenterOwner IS NOT NULL)
+                     SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' AND vb.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+
+                     IF (@RegionIds IS NOT NULL)
+                     SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' AND vb.RegionId IN (SELECT Item FROM #region_Ids)';
+
+                     IF (@LocationIds IS NOT NULL)
+                     SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' AND vb.LocationId IN (SELECT Item FROM #location_Ids)';
+
+                     IF (@DepartmentIds IS NOT NULL)
+                     SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' AND vb.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+                     IF (@OfficeIds IS NOT NULL)
+                     SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' AND vb.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+                     IF (@CountryIds IS NOT NULL)
+                     SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' AND vb.CountryId IN (SELECT Item FROM #country_Ids)';
+
+                      IF (@FinanceCostCategoryIds IS NOT NULL)
+                      SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' AND vb.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = vb.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids)';
+  
+                      IF (@ExpenseTypeIds IS NOT NULL)
+                      SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' AND vb.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+			    	IF (@CostCenterVersionIds IS NOT NULL)
+                    SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' ( (NULLIF(@CostCenterVersionIds, '') IS NULL AND vb.IsLatestVersion = 1)
+                    OR (NULLIF(@CostCenterVersionIds, '') IS NOT NULL AND vb.ForecastingCostCenterId IN (SELECT Item FROM #costCenterVersion_Ids)))'; 
+
+                    SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' )';
+				    SET @IT_BudgetCapExYTD = @IT_BudgetCapExYTD + ' END';
+
+
+			      EXEC sp_executesql @IT_BudgetCapExYTD, N'@Enum_CapExId INT,@IsBudget bit , @ForcastId int ,  @Month Int, @FiscalStartMonth Int , @FiscalYear INT, @ITBudgetCapExYTD DECIMAL OUTPUT', @Enum_CapExId,@IsBudget ,@ForcastId ,  @Month ,  @FiscalStartMonth , @FiscalYear, @ITBudgetCapExYTD OUTPUT;
+
+	END
+
+	-----------------------------------------------------------------------------------------------
+	--IT Veriance OpEx (YTD)	
+	-----------------------------------------------------------------------------------------------
+	SET @IsDisable = (SELECT IsDisable FROM @TDashboardConfig WHERE Name = 'ITVarianceOpExYTD')
+	IF(@IsDisable = 0)
+	BEGIN
+		SELECT @ITVarianceOpExYTD = ISNULL((CONVERT(DECIMAL(18, 4), (@ITCostYTD - @ITBudgetOpExYTD ))),0)
+		SELECT @ITVarianceOpExYTDPct = ISNULL((CONVERT(DECIMAL(18,4), (@ITVarianceOpExYTD) / NULLIF(@ITBudgetOpExYTD, 0))),0)
+		SELECT @ITVarianceOpExYTDEffect = CASE WHEN (@ITVarianceOpExYTDPct * 100) > @OverBudgetPct THEN 'Over Budget' WHEN (@ITVarianceOpExYTDPct * 100) < @UnderBudgetPct THEN 'Under Budget' ELSE 'Within Budget' END 
+	END
+
+	-----------------------------------------------------------------------------------------------
+	--IT Veriance CapEx (YTD)	
+	-----------------------------------------------------------------------------------------------
+	SET @IsDisable = (SELECT IsDisable FROM @TDashboardConfig WHERE Name = 'ITVarianceCapExYTD')
+	IF(@IsDisable = 0)
+	BEGIN
+		SELECT @ITVarianceCapExYTD = ISNULL((CONVERT(DECIMAL(18,4), (@ITCostCapExYTD - @ITBudgetCapExYTD ))),0)
+		SELECT @ITVarianceCapExYTDPct = ISNULL((CONVERT(DECIMAL(18, 4), (@ITVarianceCapExYTD) / NULLIF(@ITBudgetCapExYTD, 0))),0)
+		SELECT @ITVarianceCapExYTDEffect = CASE WHEN (@ITVarianceCapExYTDPct * 100) > @OverBudgetPct THEN 'Over Budget' WHEN (@ITVarianceCapExYTDPct * 100) < @UnderBudgetPct THEN 'Under Budget' ELSE 'Within Budget' END 
+	END
+	
+	-----------------------------------------------------------------------------------------------
+	--Labor OpEx YTD
+	-----------------------------------------------------------------------------------------------
+	SET @IsDisable = (SELECT IsDisable FROM @TDashboardConfig WHERE Name = 'ITCostPerLabor')
+	IF(@IsDisable = 0)
+	BEGIN
+
+		DECLARE @Labor_OpExYTD NVARCHAR(MAX);
+		set @Labor_OpExYTD =  'SELECT @LaborOpExYTD =  ISNULL(SUM(ISNULL(vwe.ExpenseAmount,0)),0)
+			FROM vw_ExpensesLight vwe 
+				INNER JOIN vw_ChartOfAccount vca ON vwe.AccountId = vca.Id
+			WHERE vca.ParentId IN (@InternalLaborCategoryId,@ExternalLaborCategoryId)
+				AND vwe.CostClassificationIDCapExOpEx =@Enum_OpExId
+				AND vwe.[Month] IN ( SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth,@Month)) 
+				AND vwe.FiscalYear = @FiscalYear '
+
+				 IF (@CostCenterIds IS NOT NULL)      
+               SET @Labor_OpExYTD = @Labor_OpExYTD + ' AND vwe.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+               
+			   If(@CostCenterOwner Is Not NUll)
+			   SET @Labor_OpExYTD = @Labor_OpExYTD + ' AND vwe.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+			   
+			   IF(@RegionIds Is not null)
+			   SET @Labor_OpExYTD = @Labor_OpExYTD + ' AND vwe.RegionId IN (SELECT Item FROM #region_Ids)';
+			   	   
+			   IF(@LocationIds Is not null)
+			   SET @Labor_OpExYTD = @Labor_OpExYTD + ' AND vwe.LocationId IN (SELECT Item FROM #location_Ids)';
+			   
+			   IF(@DepartmentIds Is not null)
+			   SET @Labor_OpExYTD = @Labor_OpExYTD + ' AND vwe.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+			   IF(@OfficeIds Is not null)
+			   SET @Labor_OpExYTD = @Labor_OpExYTD + ' AND vwe.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+			   IF(@CountryIds Is not null)
+			   SET @Labor_OpExYTD = @Labor_OpExYTD + ' AND vwe.CountryId IN (SELECT Item FROM #country_Ids)';
+
+		      IF (@FinanceCostCategoryIds IS NOT NULL)
+              SET @Labor_OpExYTD = @Labor_OpExYTD + ' AND (vwe.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = vwe.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids))';
+
+			   IF(@ExpenseTypeIds Is not null)
+			   SET @Labor_OpExYTD = @Labor_OpExYTD + ' AND vwe.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+			   IF(@BusinessUnitIds Is not null)
+			   SET @Labor_OpExYTD = @Labor_OpExYTD + ' AND vwe.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+              EXEC sp_executesql @Labor_OpExYTD, N'@Enum_OpExId INT,@InternalLaborCategoryId int  ,@ExternalLaborCategoryId int ,  @FiscalYear int , @FiscalStartMonth int  ,  @Month INT, @Year INT, @LaborOpExYTD DECIMAL OUTPUT', @Enum_OpExId,@InternalLaborCategoryId ,@ExternalLaborCategoryId , @FiscalYear ,@FiscalStartMonth ,   @Month, @Year, @LaborOpExYTD OUTPUT;
+
+		-----------------------------------------------------------------------------------------------
+		-- Labor OpEx ITCost YTD
+		-----------------------------------------------------------------------------------------------
+
+				DECLARE @Labor_OpExITCostYTD NVARCHAR(MAX);
+				set @Labor_OpExITCostYTD   =  'SELECT @LaborOpExITCostYTD  =  (ISNULL(SUM(ISNULL(vwe.ExpenseAmount,0)),0)) 
+			    FROM vw_ExpensesLight vwe 
+		    	WHERE vwe.CostClassificationIDCapExOpEx = @Enum_OpExId
+				AND vwe.[Month] IN ( SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth,@Month)) 
+				AND vwe.FiscalYear = @FiscalYear '
+
+			    IF (@CostCenterIds IS NOT NULL)      
+                SET @Labor_OpExITCostYTD = @Labor_OpExITCostYTD + ' AND vwe.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+               
+			   If(@CostCenterOwner Is Not NUll)
+			   SET @Labor_OpExITCostYTD = @Labor_OpExITCostYTD + ' AND vwe.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+			   
+			   IF(@RegionIds Is not null)
+			   SET @Labor_OpExITCostYTD = @Labor_OpExITCostYTD + ' AND vwe.RegionId IN (SELECT Item FROM #region_Ids)';
+			   	   
+			   IF(@LocationIds Is not null)
+			   SET @Labor_OpExITCostYTD = @Labor_OpExITCostYTD + ' AND vwe.LocationId IN (SELECT Item FROM #location_Ids)';
+			   
+			   IF(@DepartmentIds Is not null)
+			   SET @Labor_OpExITCostYTD = @Labor_OpExITCostYTD + ' AND vwe.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+			   IF(@OfficeIds Is not null)
+			   SET @Labor_OpExITCostYTD = @Labor_OpExITCostYTD + ' AND vwe.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+			   IF(@CountryIds Is not null)
+			   SET @Labor_OpExITCostYTD = @Labor_OpExITCostYTD + ' AND vwe.CountryId IN (SELECT Item FROM #country_Ids)';
+
+		      IF (@FinanceCostCategoryIds IS NOT NULL)
+              SET @Labor_OpExITCostYTD = @Labor_OpExITCostYTD + ' AND (vwe.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = vwe.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids))';
+
+			   IF(@ExpenseTypeIds Is not null)
+			   SET @Labor_OpExITCostYTD = @Labor_OpExITCostYTD + ' AND vwe.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+			   IF(@BusinessUnitIds Is not null)
+			   SET @Labor_OpExITCostYTD = @Labor_OpExITCostYTD + ' AND vwe.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+              EXEC sp_executesql @Labor_OpExITCostYTD, N'@Enum_OpExId INT ,  @FiscalYear int , @FiscalStartMonth int  ,  @Month INT, @LaborOpExITCostYTD DECIMAL OUTPUT', @Enum_OpExId , @FiscalYear ,@FiscalStartMonth ,   @Month, @LaborOpExITCostYTD OUTPUT;
+
+		-----------------------------------------------------------------------------------------------
+		-- Labor % of ITCost YTD
+		-----------------------------------------------------------------------------------------------
+		SELECT @LaborITCostPctYTD = (
+				SELECT (@LaborOpExYTD / NULLIF(ISNULL(@LaborOpExITCostYTD,0),0))
+		)
+				
+	END
+	
+	-----------------------------------------------------------------------------------------------
+	-- Vendors OpEx YTD
+	-----------------------------------------------------------------------------------------------
+	SET @IsDisable = (SELECT IsDisable FROM @TDashboardConfig WHERE Name = 'ITCostPerVendor')
+	IF(@IsDisable = 0)
+	BEGIN
+
+					DECLARE @Vendors_OpExYTD NVARCHAR(MAX);
+					set @Vendors_OpExYTD =  'SELECT @VendorsOpExYTD =  ISNULL(SUM(ISNULL(ve.ExpenseAmount,0)),0) 
+		        	FROM vw_ExpensesLight ve
+		        	WHERE ve.CostClassificationIDCapExOpEx = @Enum_OpExId
+		    		AND ve.[Month] IN ( SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth,@Month)) 
+			    	AND ve.FiscalYear = @FiscalYear
+			    	AND ve.VendorId > 0  '
+
+				IF (@CostCenterIds IS NOT NULL)      
+                SET @Vendors_OpExYTD = @Vendors_OpExYTD + ' AND ve.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+               
+			   If(@CostCenterOwner Is Not NUll)
+			   SET @Vendors_OpExYTD = @Vendors_OpExYTD + ' AND ve.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+			   
+			   IF(@RegionIds Is not null)
+			   SET @Vendors_OpExYTD = @Vendors_OpExYTD + ' AND ve.RegionId IN (SELECT Item FROM #region_Ids)';
+			   	   
+			   IF(@LocationIds Is not null)
+			   SET @Vendors_OpExYTD = @Vendors_OpExYTD + ' AND ve.LocationId IN (SELECT Item FROM #location_Ids)';
+			   
+			   IF(@DepartmentIds Is not null)
+			   SET @Vendors_OpExYTD = @Vendors_OpExYTD + ' AND ve.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+			   IF(@OfficeIds Is not null)
+			   SET @Vendors_OpExYTD = @Vendors_OpExYTD + ' AND ve.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+			   IF(@CountryIds Is not null)
+			   SET @Vendors_OpExYTD = @Vendors_OpExYTD + ' AND ve.CountryId IN (SELECT Item FROM #country_Ids)';
+
+		      IF (@FinanceCostCategoryIds IS NOT NULL)
+              SET @Vendors_OpExYTD = @Vendors_OpExYTD + ' AND (ve.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = ve.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids))';
+
+			   IF(@ExpenseTypeIds Is not null)
+			   SET @Vendors_OpExYTD = @Vendors_OpExYTD + ' AND ve.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+			   IF(@BusinessUnitIds Is not null)
+			   SET @Vendors_OpExYTD = @Vendors_OpExYTD + ' AND ve.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+              EXEC sp_executesql @Vendors_OpExYTD, N'@Enum_OpExId INT ,  @FiscalYear int , @FiscalStartMonth int  ,  @Month INT, @VendorsOpExYTD DECIMAL OUTPUT', @Enum_OpExId , @FiscalYear ,@FiscalStartMonth ,   @Month, @VendorsOpExYTD OUTPUT;
+
+		-----------------------------------------------------------------------------------------------
+		-- Vendors % of ITCost YTD
+		-- Vendor as % of IT cost =Total Vendor spend (YTD) / IT Cost YTD 
+		-----------------------------------------------------------------------------------------------
+		PRINT CAST(@VendorsOpExYTD AS nvarchar(20))
+
+					DECLARE @Vendors_ITCostPctYTD NVARCHAR(MAX);
+				   set @Vendors_ITCostPctYTD   =  'SELECT @VendorsITCostPctYTD =  @VendorsOpExYTD/( NULLIF(SUM(ISNULL(ve.ExpenseAmount,0)),0) ) 
+			FROM vw_ExpensesLight ve
+			WHERE ve.CostClassificationIDCapExOpEx = @Enum_OpExId
+				AND ve.[Month] IN ( SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth,@Month)) 
+				AND ve.FiscalYear = @FiscalYear	 '
+
+				IF (@CostCenterIds IS NOT NULL)      
+                SET @Vendors_ITCostPctYTD = @Vendors_ITCostPctYTD + ' AND ve.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+               
+			   If(@CostCenterOwner Is Not NUll)
+			   SET @Vendors_ITCostPctYTD = @Vendors_ITCostPctYTD + ' AND ve.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+			   
+			   IF(@RegionIds Is not null)
+			   SET @Vendors_ITCostPctYTD = @Vendors_ITCostPctYTD + ' AND ve.RegionId IN (SELECT Item FROM #region_Ids)';
+			   	   
+			   IF(@LocationIds Is not null)
+			   SET @Vendors_ITCostPctYTD = @Vendors_ITCostPctYTD + ' AND ve.LocationId IN (SELECT Item FROM #location_Ids)';
+			   
+			   IF(@DepartmentIds Is not null)
+			   SET @Vendors_ITCostPctYTD = @Vendors_ITCostPctYTD + ' AND ve.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+			   IF(@OfficeIds Is not null)
+			   SET @Vendors_ITCostPctYTD = @Vendors_ITCostPctYTD + ' AND ve.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+			   IF(@CountryIds Is not null)
+			   SET @Vendors_ITCostPctYTD = @Vendors_ITCostPctYTD + ' AND ve.CountryId IN (SELECT Item FROM #country_Ids)';
+
+		      IF (@FinanceCostCategoryIds IS NOT NULL)
+              SET @Vendors_ITCostPctYTD = @Vendors_ITCostPctYTD + ' AND (ve.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = ve.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids))';
+
+			   IF(@ExpenseTypeIds Is not null)
+			   SET @Vendors_ITCostPctYTD = @Vendors_ITCostPctYTD + ' AND ve.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+			   IF(@BusinessUnitIds Is not null)
+			   SET @Vendors_ITCostPctYTD = @Vendors_ITCostPctYTD + ' AND ve.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+              EXEC sp_executesql @Vendors_ITCostPctYTD, N'@Enum_OpExId INT , @VendorsOpExYTD DECIMAL ,  @FiscalYear int , @FiscalStartMonth int  ,  @Month INT, @VendorsITCostPctYTD DECIMAL OUTPUT', @Enum_OpExId ,@VendorsOpExYTD , @FiscalYear ,@FiscalStartMonth ,   @Month, @VendorsITCostPctYTD OUTPUT;
+
+	END
+	
+	-----------------------------------------------------------------------------------------------
+	--IT SPEND  !!Important For ITSpend we take both CapEx & OpEx(IsPrepaid) from vw_CapExLight 
+	-----------------------------------------------------------------------------------------------
+	SET @IsDisable = (SELECT IsDisable FROM @TDashboardConfig WHERE Name = 'ITSpendRevenue')
+	IF(@IsDisable = 0)
+	BEGIN
+
+						DECLARE @IT_Spend NVARCHAR(MAX);
+						set @IT_Spend =  '	SELECT @ITSpend  =   ( select ISNULL(SUM(ISNULL(appExp.expenseAmount,0)),0)  
+			             FROM vw_ExpensesLight appExp 
+			            WHERE appExp.CostClassificationIDCapExOpEx = @Enum_OpExId AND appExp.AlreadyDepreciatedAmortized = 0 
+			         	AND	appExp.[Month] IN (SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth,@Month)) 
+			          	AND FiscalYear = @FiscalYear '
+
+				IF (@CostCenterIds IS NOT NULL)      
+                SET @IT_Spend = @IT_Spend + ' AND appExp.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+               
+			   If(@CostCenterOwner Is Not NUll)
+			   SET @IT_Spend = @IT_Spend + ' AND appExp.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+			   
+			   IF(@RegionIds Is not null)
+			   SET @IT_Spend = @IT_Spend + ' AND appExp.RegionId IN (SELECT Item FROM #region_Ids)';
+			   	   
+			   IF(@LocationIds Is not null)
+			   SET @IT_Spend = @IT_Spend + ' AND appExp.LocationId IN (SELECT Item FROM #location_Ids)';
+			   
+			   IF(@DepartmentIds Is not null)
+			   SET @IT_Spend = @IT_Spend + ' AND appExp.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+			   IF(@OfficeIds Is not null)
+			   SET @IT_Spend = @IT_Spend + ' AND appExp.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+			   IF(@CountryIds Is not null)
+			   SET @IT_Spend = @IT_Spend + ' AND appExp.CountryId IN (SELECT Item FROM #country_Ids)';
+
+		      IF (@FinanceCostCategoryIds IS NOT NULL)
+              SET @IT_Spend = @IT_Spend + ' AND (appExp.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = appExp.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids))';
+
+			   IF(@ExpenseTypeIds Is not null)
+			   SET @IT_Spend = @IT_Spend + ' AND appExp.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+			   IF(@BusinessUnitIds Is not null)
+			   SET @IT_Spend = @IT_Spend + ' AND appExp.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+			   			    SET @IT_Spend = @IT_Spend + ' )';
+
+
+			    SET @IT_Spend = @IT_Spend + ' +';
+
+
+		      	set @IT_Spend  =  @IT_Spend + '(SELECT	ISNULL(SUM(ISNULL(appCap.Amount,0)),0) AS amount 
+			     FROM vw_CapExLight appCap
+			      WHERE appCap.[Month] IN (SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth,@Month)) 
+				 AND appCap.FiscalYear = @FiscalYear '
+
+				 IF (@CostCenterIds IS NOT NULL)      
+                SET @IT_Spend = @IT_Spend + ' AND appCap.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+               
+			   If(@CostCenterOwner Is Not NUll)
+			   SET @IT_Spend = @IT_Spend + ' AND appCap.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+			   
+			   IF(@RegionIds Is not null)
+			   SET @IT_Spend = @IT_Spend + ' AND appCap.RegionId IN (SELECT Item FROM #region_Ids)';
+			   	   
+			   IF(@LocationIds Is not null)
+			   SET @IT_Spend = @IT_Spend + ' AND appCap.LocationId IN (SELECT Item FROM #location_Ids)';
+			   
+			   IF(@DepartmentIds Is not null)
+			   SET @IT_Spend = @IT_Spend + ' AND appCap.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+			   IF(@OfficeIds Is not null)
+			   SET @IT_Spend = @IT_Spend + ' AND appCap.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+			   IF(@CountryIds Is not null)
+			   SET @IT_Spend = @IT_Spend + ' AND appCap.CountryId IN (SELECT Item FROM #country_Ids)';
+
+		      IF (@FinanceCostCategoryIds IS NOT NULL)
+              SET @IT_Spend = @IT_Spend + ' AND (appCap.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = appCap.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids))';
+
+			   IF(@ExpenseTypeIds Is not null)
+			   SET @IT_Spend = @IT_Spend + ' AND appCap.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+			   IF(@BusinessUnitIds Is not null)
+			   SET @IT_Spend = @IT_Spend + ' AND appCap.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+			   			   			    SET @IT_Spend = @IT_Spend + ' )';
+
+
+			   EXEC sp_executesql @IT_Spend, N'@Enum_OpExId INT , @VendorsOpExYTD DECIMAL ,  @FiscalYear int , @FiscalStartMonth int  ,  @Month INT, @ITSpend DECIMAL OUTPUT', @Enum_OpExId ,@VendorsOpExYTD , @FiscalYear ,@FiscalStartMonth ,   @Month, @ITSpend OUTPUT;
+
+		-----------------------------------------------------------------------------------------------
+		--IT Revenue YTD
+		-----------------------------------------------------------------------------------------------
+		SELECT @ITRevenue = (
+			SELECT ISNULL(SUM(ISNULL(Revenue,0)),0)
+			FROM AppCompanyRevenue
+			WHERE FiscalYear = @FiscalYear AND [month] IN (SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth,@Month))
+		)
+
+		-----------------------------------------------------------------------------------------------
+		--IT SpendVRevenue 
+		-----------------------------------------------------------------------------------------------
+		SELECT @ITSpendVRevenue = CASE WHEN @ITRevenue=0 THEN '' ELSE CONVERT(VARCHAR,(@ITSpend / @ITRevenue))  END 
+	 
+		-----------------------------------------------------------------------------------------------
+		--IT Spend Revenue Chart
+		-----------------------------------------------------------------------------------------------
+
+		DECLARE @IT_SpendRevenueChart NVARCHAR(MAX);
+		set @IT_SpendRevenueChart =  'SELECT @ITSpendRevenueChart = (SELECT CONVERT(NVARCHAR, FORMAT(DATEFROMPARTS([Year],[Month],1), ''MMM yyyy'')) AS [MonthYear],
+				CASE WHEN Revenue= 0 THEN 0 ELSE (Amount/Revenue) END AS RevenuePct FROM 
+				(
+						SELECT t.[Year], t.[Month], ISNULL(SUM(ISNULL(t.Amount,0)),0) AS Amount,
+						(SELECT ISNULL(SUM(ISNULL(Revenue,0)),0)
+						FROM AppCompanyRevenue
+						WHERE [Year] = t.[Year] AND [Month] = t.[Month]
+						GROUP BY [Month]) AS Revenue
+				FROM (	
+					(SELECT appExp.[Year], appExp.[Month],ISNULL(SUM(ISNULL(appExp.expenseAmount,0)),0) AS Amount 
+					 FROM vw_ExpensesLight appExp 
+					 WHERE appExp.CostClassificationIDCapExOpEx = @Enum_OpExId AND appExp.AlreadyDepreciatedAmortized = 0 
+						AND	appExp.[Month] IN (SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth,@Month)) 
+						AND appExp.FiscalYear = @FiscalYear '
+
+				IF (@CostCenterIds IS NOT NULL)      
+                SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' AND appExp.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+               
+			   If(@CostCenterOwner Is Not NUll)
+			   SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' AND appExp.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+			   
+			   IF(@RegionIds Is not null)
+			   SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' AND appExp.RegionId IN (SELECT Item FROM #region_Ids)';
+			   	   
+			   IF(@LocationIds Is not null)
+			   SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' AND appExp.LocationId IN (SELECT Item FROM #location_Ids)';
+			   
+			   IF(@DepartmentIds Is not null)
+			   SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' AND appExp.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+			   IF(@OfficeIds Is not null)
+			   SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' AND appExp.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+			   IF(@CountryIds Is not null)
+			   SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' AND appExp.CountryId IN (SELECT Item FROM #country_Ids)';
+
+		      IF (@FinanceCostCategoryIds IS NOT NULL)
+              SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' AND (appExp.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = appExp.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids))';
+
+			   IF(@ExpenseTypeIds Is not null)
+			   SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' AND appExp.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+			   IF(@BusinessUnitIds Is not null)
+			   SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' AND appExp.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+			  SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + 'GROUP BY appExp.[Year], appExp.[Month]';
+
+
+			     SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' )';
+				 SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' UNION';
+
+				set  @IT_SpendRevenueChart   =  @IT_SpendRevenueChart  + '(SELECT	appCap.[Year], appCap.[Month],ISNULL(SUM(ISNULL(appCap.Amount,0)),0) AS amount 
+					 FROM vw_CapExLight appCap
+					 WHERE appCap.[Month] IN (SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth,@Month)) 
+					 AND appCap.FiscalYear = @FiscalYear '
+
+
+				IF (@CostCenterIds IS NOT NULL)      
+                SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' AND appCap.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+               
+			   If(@CostCenterOwner Is Not NUll)
+			   SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' AND appCap.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+			   
+			   IF(@RegionIds Is not null)
+			   SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' AND appCap.RegionId IN (SELECT Item FROM #region_Ids)';
+			   	   
+			   IF(@LocationIds Is not null)
+			   SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' AND appCap.LocationId IN (SELECT Item FROM #location_Ids)';
+			   
+			   IF(@DepartmentIds Is not null)
+			   SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' AND appCap.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+			   IF(@OfficeIds Is not null)
+			   SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' AND appCap.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+			   IF(@CountryIds Is not null)
+			   SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' AND appCap.CountryId IN (SELECT Item FROM #country_Ids)';
+
+		      IF (@FinanceCostCategoryIds IS NOT NULL)
+              SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' AND (appCap.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = appCap.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids))';
+
+			   IF(@ExpenseTypeIds Is not null)
+			   SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' AND appCap.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+			   IF(@BusinessUnitIds Is not null)
+			   SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' AND appCap.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+			   SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + 'GROUP BY appCap.[Year], appCap.[Month]';
+
+			     SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + ' )';
+
+   													   SET @IT_SpendRevenueChart = @IT_SpendRevenueChart + 
+	                                                   ') AS t GROUP BY t.[Year], t.[Month]
+	                                                 ) r ORDER BY r.[Year], r.[Month]
+                                                	FOR JSON PATH, INCLUDE_NULL_VALUES);';
+
+	   EXEC sp_executesql @IT_SpendRevenueChart, N'@Enum_OpExId INT , @VendorsOpExYTD DECIMAL ,  @FiscalYear int , @FiscalStartMonth int  ,  @Month INT, @ITSpendRevenueChart  NVARCHAR(MAX) OUTPUT', @Enum_OpExId ,@VendorsOpExYTD , @FiscalYear ,@FiscalStartMonth ,   @Month, @ITSpendRevenueChart OUTPUT;
+	   END
+
+	-----------------------------------------------------------------------------------------------
+	--CapExOpEx
+	-----------------------------------------------------------------------------------------------
+	SET @IsDisable = (SELECT IsDisable FROM @TDashboardConfig WHERE Name = 'OpExToCapEx')
+	IF(@IsDisable = 0)
+	BEGIN
+
+			DECLARE @CapEx_OpEx NVARCHAR(MAX);
+            SET @CapEx_OpEx =  
+          	'SELECT @CapExOpEx = ((  SELECT CONVERT(NVARCHAR(256), ISNULL(SUM(ISNULL(appCap.Amount, 0)), 0)) AS amount 
+			 FROM vw_CapExLight appCap
+			 WHERE appCap.CapExOpEx = @Enum_CapExId
+				AND appCap.[Month] IN (SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth, @Month)) 
+				AND appCap.FiscalYear = @FiscalYear';
+
+
+				IF (@CostCenterIds IS NOT NULL)      
+                SET @CapEx_OpEx = @CapEx_OpEx + ' AND appCap.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+               
+			   If(@CostCenterOwner Is Not NUll)
+			   SET @CapEx_OpEx = @CapEx_OpEx + ' AND appCap.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+			   
+			   IF(@RegionIds Is not null)
+			   SET @CapEx_OpEx = @CapEx_OpEx + ' AND appCap.RegionId IN (SELECT Item FROM #region_Ids)';
+			   	   
+			   IF(@LocationIds Is not null)
+			   SET @CapEx_OpEx = @CapEx_OpEx + ' AND appCap.LocationId IN (SELECT Item FROM #location_Ids)';
+			   
+			   IF(@DepartmentIds Is not null)
+			   SET @CapEx_OpEx = @CapEx_OpEx + ' AND appCap.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+			   IF(@OfficeIds Is not null)
+			   SET @CapEx_OpEx = @CapEx_OpEx + ' AND appCap.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+			   IF(@CountryIds Is not null)
+			   SET @CapEx_OpEx = @CapEx_OpEx + ' AND appCap.CountryId IN (SELECT Item FROM #country_Ids)';
+
+		      IF (@FinanceCostCategoryIds IS NOT NULL)
+              SET @CapEx_OpEx = @CapEx_OpEx + ' AND (appCap.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = appCap.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids))';
+
+			   IF(@ExpenseTypeIds Is not null)
+			   SET @CapEx_OpEx = @CapEx_OpEx + ' AND appCap.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+			   IF(@BusinessUnitIds Is not null)
+			   SET @CapEx_OpEx = @CapEx_OpEx + ' AND appCap.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+              SET @CapEx_OpEx = @CapEx_OpEx + ') ';
+			  SET @CapEx_OpEx = @CapEx_OpEx + ' + '':'' +';
+
+				set  @CapEx_OpEx  =  @CapEx_OpEx + '  (SELECT CONVERT(NVARCHAR(256),ISNULL(SUM(ISNULL(appExp.expenseAmount,0)),0)) AS amount 
+					FROM vw_ExpensesLight appExp
+					WHERE appExp.CostClassificationIDCapExOpEx = @Enum_OpExId 
+					AND appExp.[Month] IN (SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth,@Month)) 
+					AND appExp.FiscalYear = @FiscalYear'
+
+						IF (@CostCenterIds IS NOT NULL)      
+                SET @CapEx_OpEx = @CapEx_OpEx + ' AND appExp.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+               
+			   If(@CostCenterOwner Is Not NUll)
+			   SET @CapEx_OpEx = @CapEx_OpEx + ' AND appExp.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+			   
+			   IF(@RegionIds Is not null)
+			   SET @CapEx_OpEx = @CapEx_OpEx + ' AND appExp.RegionId IN (SELECT Item FROM #region_Ids)';
+			   	   
+			   IF(@LocationIds Is not null)
+			   SET @CapEx_OpEx = @CapEx_OpEx + ' AND appExp.LocationId IN (SELECT Item FROM #location_Ids)';
+			   
+			   IF(@DepartmentIds Is not null)
+			   SET @CapEx_OpEx = @CapEx_OpEx + ' AND appExp.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+			   IF(@OfficeIds Is not null)
+			   SET @CapEx_OpEx = @CapEx_OpEx + ' AND appExp.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+			   IF(@CountryIds Is not null)
+			   SET @CapEx_OpEx = @CapEx_OpEx + ' AND appExp.CountryId IN (SELECT Item FROM #country_Ids)';
+
+		      IF (@FinanceCostCategoryIds IS NOT NULL)
+              SET @CapEx_OpEx = @CapEx_OpEx + ' AND (appExp.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = appExp.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids))';
+
+			   IF(@ExpenseTypeIds Is not null)
+			   SET @CapEx_OpEx = @CapEx_OpEx + ' AND appExp.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+			   IF(@BusinessUnitIds Is not null)
+			   SET @CapEx_OpEx = @CapEx_OpEx + ' AND appExp.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+			   SET @CapEx_OpEx = @CapEx_OpEx + ')';
+			   			   SET @CapEx_OpEx = @CapEx_OpEx + ')';
+
+			   EXEC sp_executesql @CapEx_OpEx, N'@Enum_CapExId INT ,@Enum_OpExId int  ,  @VendorsOpExYTD DECIMAL ,  @FiscalYear int , @FiscalStartMonth int  ,  @Month INT, @CapExOpEx NVARCHAR(256) OUTPUT', @Enum_CapExId , @Enum_OpExId , @VendorsOpExYTD , @FiscalYear ,@FiscalStartMonth ,   @Month, @CapExOpEx OUTPUT;
+	END
+	
+	-----------------------------------------------------------------------------------------------
+	--IT Cost to Plan (YTD) - Line chart
+	-----------------------------------------------------------------------------------------------
+	SET @IsDisable = (SELECT IsDisable FROM @TDashboardConfig WHERE Name = 'ITCostToPlan')
+	IF(@IsDisable = 0)
+	BEGIN
+	    DECLARE @IT_CostToPlan NVARCHAR(MAX);
+		set @IT_CostToPlan =  'SELECT @ITCostToPlan = (SELECT  CONVERT(NVARCHAR, FORMAT(DATEFROMPARTS(t.[year],t.[Month],1),''MMM yyyy'')) AS ''ITCostToPlan.Month'' ,
+			CONVERT(NVARCHAR,ISNULL(SUM(ISNULL(t.ITCost,0)),0)) AS ''ITCostToPlan.ITCost'',
+			CONVERT(NVARCHAR,ISNULL(SUM(ISNULL(t.ITPlan,0)),0)) AS ''ITCostToPlan.ITPlan''
+			FROM (
+				SELECT [Month],year,
+					( SELECT ISNULL(SUM(ISNULL(appExp.ExpenseAmount,0)),0)
+						FROM vw_ExpensesLight appExp
+						WHERE appExp.CostClassificationIDCapExOpEx = @Enum_OpExId
+						AND appExp.[Month] IN (SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth,e.month)) 
+						AND appExp.FiscalYear = @FiscalYear'
+
+	IF (@CostCenterIds IS NOT NULL)      
+    SET @IT_CostToPlan = @IT_CostToPlan + ' AND appExp.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+
+    IF (@CostCenterOwner IS NOT NULL)
+    SET @IT_CostToPlan = @IT_CostToPlan + ' AND appExp.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+
+    IF (@RegionIds IS NOT NULL)
+    SET @IT_CostToPlan = @IT_CostToPlan + ' AND appExp.RegionId IN (SELECT Item FROM #region_Ids)';
+
+    IF (@LocationIds IS NOT NULL)
+    SET @IT_CostToPlan = @IT_CostToPlan + ' AND appExp.LocationId IN (SELECT Item FROM #location_Ids)';
+
+    IF (@DepartmentIds IS NOT NULL)
+    SET @IT_CostToPlan = @IT_CostToPlan + ' AND appExp.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+    IF (@OfficeIds IS NOT NULL)
+    SET @IT_CostToPlan = @IT_CostToPlan + ' AND appExp.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+    IF (@CountryIds IS NOT NULL)
+    SET @IT_CostToPlan = @IT_CostToPlan + ' AND appExp.CountryId IN (SELECT Item FROM #country_Ids)';
+
+    IF (@FinanceCostCategoryIds IS NOT NULL)
+    SET @IT_CostToPlan = @IT_CostToPlan + ' AND (appExp.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = appExp.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids))';
+ 
+    IF (@ExpenseTypeIds IS NOT NULL)
+    SET @IT_CostToPlan = @IT_CostToPlan + ' AND appExp.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+    IF (@BusinessUnitIds IS NOT NULL)
+    SET @IT_CostToPlan = @IT_CostToPlan + ' AND appExp.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+	set @IT_CostToPlan  =  @IT_CostToPlan + ') ITCost,
+					CASE WHEN @IsBudget = 1 THEN
+					(   SELECT ISNULL(SUM(ISNULL(vbd.Amount,0)),0)
+						FROM vw_BudgetPlanDetails vbd
+						WHERE vbd.FiscalYear = @FiscalYear 
+							AND vbd.CapExOpEx = @Enum_OpExId 
+							AND ( (e.month >= @FiscalStartMonth AND (vbd.[Month] >= @FiscalStartMonth AND vbd.[Month] <= e.month))
+							OR (e.month < @FiscalStartMonth AND (vbd.[Month] >= @FiscalStartMonth OR vbd.[Month] <= e.month)) )'
+
+								IF (@CostCenterIds IS NOT NULL)      
+    SET @IT_CostToPlan = @IT_CostToPlan + ' AND vbd.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+
+    IF (@CostCenterOwner IS NOT NULL)
+    SET @IT_CostToPlan = @IT_CostToPlan + ' AND vbd.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+
+    IF (@RegionIds IS NOT NULL)
+    SET @IT_CostToPlan = @IT_CostToPlan + ' AND vbd.RegionId IN (SELECT Item FROM #region_Ids)';
+
+    IF (@LocationIds IS NOT NULL)
+    SET @IT_CostToPlan = @IT_CostToPlan + ' AND vbd.LocationId IN (SELECT Item FROM #location_Ids)';
+
+    IF (@DepartmentIds IS NOT NULL)
+    SET @IT_CostToPlan = @IT_CostToPlan + ' AND vbd.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+    IF (@OfficeIds IS NOT NULL)
+    SET @IT_CostToPlan = @IT_CostToPlan + ' AND vbd.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+    IF (@CountryIds IS NOT NULL)
+    SET @IT_CostToPlan = @IT_CostToPlan + ' AND vbd.CountryId IN (SELECT Item FROM #country_Ids)';
+
+    IF (@FinanceCostCategoryIds IS NOT NULL)
+    SET @IT_CostToPlan = @IT_CostToPlan + ' AND (vbd.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = vbd.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids))';
+ 
+    IF (@ExpenseTypeIds IS NOT NULL)
+    SET @IT_CostToPlan = @IT_CostToPlan + ' AND vbd.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+    IF (@BusinessUnitIds IS NOT NULL)
+    SET @IT_CostToPlan = @IT_CostToPlan + ' AND vbd.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+	set @IT_CostToPlan  =  @IT_CostToPlan + ') ELSE
+					(   SELECT ISNULL(SUM(ISNULL(vbd.Amount,0)),0)
+						FROM vw_BudgetForecastingDetails vbd
+						WHERE vbd.FiscalYear = @FiscalYear 
+							AND vbd.ForecastingId = @ForcastId
+							AND vbd.CapExOpEx = @Enum_OpExId 
+							AND ( (e.month >= @FiscalStartMonth AND (vbd.[Month] >= @FiscalStartMonth AND vbd.[Month] <= e.month))
+							OR (e.month < @FiscalStartMonth AND (vbd.[Month] >= @FiscalStartMonth OR vbd.[Month] <= e.month)) )'
+
+								 IF (@CostCenterIds IS NOT NULL)      
+                     SET @IT_CostToPlan = @IT_CostToPlan + ' AND vbd.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+
+                     IF (@CostCenterOwner IS NOT NULL)
+                     SET @IT_CostToPlan = @IT_CostToPlan + ' AND vbd.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+
+                     IF (@RegionIds IS NOT NULL)
+                     SET @IT_CostToPlan = @IT_CostToPlan + ' AND vbd.RegionId IN (SELECT Item FROM #region_Ids)';
+
+                     IF (@LocationIds IS NOT NULL)
+                     SET @IT_CostToPlan = @IT_CostToPlan + ' AND vbd.LocationId IN (SELECT Item FROM #location_Ids)';
+
+                     IF (@DepartmentIds IS NOT NULL)
+                     SET @IT_CostToPlan = @IT_CostToPlan + ' AND vbd.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+                     IF (@OfficeIds IS NOT NULL)
+                     SET @IT_CostToPlan = @IT_CostToPlan + ' AND vbd.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+                     IF (@CountryIds IS NOT NULL)
+                     SET @IT_CostToPlan = @IT_CostToPlan + ' AND vbd.CountryId IN (SELECT Item FROM #country_Ids)';
+
+                      IF (@FinanceCostCategoryIds IS NOT NULL)
+                      SET @IT_CostToPlan = @IT_CostToPlan + ' AND vbd.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = vbd.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids)';
+  
+                      IF (@ExpenseTypeIds IS NOT NULL)
+                      SET @IT_CostToPlan = @IT_CostToPlan + ' AND vbd.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+			    	IF (@CostCenterVersionIds IS NOT NULL)
+                    SET @IT_CostToPlan = @IT_CostToPlan + ' ( (NULLIF(@CostCenterVersionIds, '') IS NULL AND vbd.IsLatestVersion = 1)
+                    OR (NULLIF(@CostCenterVersionIds, '') IS NOT NULL AND vbd.ForecastingCostCenterId IN (SELECT Item FROM #costCenterVersion_Ids)))'; 
+
+					set @IT_CostToPlan  =  @IT_CostToPlan  + ') END ITPlan
+				FROM (SELECT [month],dbo.fnGetActualYear(@FiscalStartMonth,ea.month,@FiscalYear) [Year]
+					FROM (SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth,@Month)) ea
+				) e
+				GROUP BY [MONTH],[Year]
+			) AS t 
+			GROUP BY t.[MONTH],t.[Year]
+			ORDER BY t.[Year], t.[Month]
+		FOR JSON PATH, INCLUDE_NULL_VALUES)';
+
+		EXEC sp_executesql @IT_CostToPlan, N'@Enum_CapExId INT  ,@IsBudget bit, @ForcastId int  , @Enum_OpExId int  ,  @VendorsOpExYTD DECIMAL ,  @FiscalYear int , @FiscalStartMonth int  ,  @Month INT, @ITCostToPlan NVARCHAR(2048) OUTPUT', @Enum_CapExId  ,@IsBudget, @ForcastId ,  @Enum_OpExId , @VendorsOpExYTD , @FiscalYear ,@FiscalStartMonth ,   @Month, @ITCostToPlan OUTPUT;
+
+	END
+	
+	-----------------------------------------------------------------------------------------------
+	--Top 10 Cost Center OpEx
+	-----------------------------------------------------------------------------------------------
+	SET @IsDisable = (SELECT IsDisable FROM @TDashboardConfig WHERE Name = 'OpExCostCenterOwners')
+	IF(@IsDisable = 0)
+	BEGIN
+
+				DECLARE @Top10_CostCenterOpEx NVARCHAR(MAX);
+
+               SET @Top10_CostCenterOpEx = '
+               SELECT @Top10CostCenterOpEx = (
+               SELECT TOP 10 
+               appExp.CostCenterCCOwner AS costcenterowner,
+               ISNULL(SUM(appExp.ExpenseAmount),0) AS expenseamount
+               FROM vw_ExpensesLight AS appExp 
+               WHERE appExp.CostClassificationIDCapExOpEx = @Enum_OpExId 
+               AND appExp.[Month] IN (SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth,@Month)) 
+               AND appExp.FiscalYear = @FiscalYear ';
+
+    IF (@CostCenterIds IS NOT NULL)      
+    SET @Top10_CostCenterOpEx = @Top10_CostCenterOpEx + ' AND appExp.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+
+    IF (@CostCenterOwner IS NOT NULL)
+    SET @Top10_CostCenterOpEx = @Top10_CostCenterOpEx + ' AND appExp.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+
+    IF (@RegionIds IS NOT NULL)
+    SET @Top10_CostCenterOpEx = @Top10_CostCenterOpEx + ' AND appExp.RegionId IN (SELECT Item FROM #region_Ids)';
+
+    IF (@LocationIds IS NOT NULL)
+    SET @Top10_CostCenterOpEx = @Top10_CostCenterOpEx + ' AND appExp.LocationId IN (SELECT Item FROM #location_Ids)';
+
+    IF (@DepartmentIds IS NOT NULL)
+    SET @Top10_CostCenterOpEx = @Top10_CostCenterOpEx + ' AND appExp.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+    IF (@OfficeIds IS NOT NULL)
+    SET @Top10_CostCenterOpEx = @Top10_CostCenterOpEx + ' AND appExp.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+    IF (@CountryIds IS NOT NULL)
+    SET @Top10_CostCenterOpEx = @Top10_CostCenterOpEx + ' AND appExp.CountryId IN (SELECT Item FROM #country_Ids)';
+
+    IF (@FinanceCostCategoryIds IS NOT NULL)
+    SET @Top10_CostCenterOpEx = @Top10_CostCenterOpEx + ' AND (appExp.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = appExp.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids))';
+ 
+    IF (@ExpenseTypeIds IS NOT NULL)
+    SET @Top10_CostCenterOpEx = @Top10_CostCenterOpEx + ' AND appExp.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+    IF (@BusinessUnitIds IS NOT NULL)
+    SET @Top10_CostCenterOpEx = @Top10_CostCenterOpEx + ' AND appExp.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+        SET @Top10_CostCenterOpEx = @Top10_CostCenterOpEx + '
+        GROUP BY appExp.CostCenterCCOwner
+        ORDER BY ISNULL(SUM(appExp.ExpenseAmount),0) DESC
+        FOR JSON PATH, INCLUDE_NULL_VALUES)';
+
+      EXEC sp_executesql @Top10_CostCenterOpEx, N'@Enum_OpExId INT, @FiscalYear INT, @FiscalStartMonth INT, @Month INT, @Top10CostCenterOpEx NVARCHAR(MAX) OUTPUT', @Enum_OpExId, @FiscalYear, @FiscalStartMonth, @Month, @Top10CostCenterOpEx OUTPUT;
+
+	END
+	
+	-----------------------------------------------------------------------------------------------
+	--Cost By Business Unit
+	-----------------------------------------------------------------------------------------------
+
+
+	SET @IsDisable = (SELECT IsDisable FROM @TDashboardConfig WHERE Name = 'CostbyBusinessUnit')
+	IF(@IsDisable = 0)
+	BEGIN
+	 
+    DECLARE @CostBy_BusinessUnitYTD NVARCHAR(MAX);
+    SET @CostBy_BusinessUnitYTD =  'SELECT @CostByBusinessUnitYTD = (SELECT bu.Id BusinessUnitId, bu.BusinessUnitName, ISNULL(SUM(e.ExpenseAmount),0) Amount
+        FROM vw_ExpensesLight e  
+        INNER JOIN AppBusinessUnits bu ON bu.Id = e.BusinessUnitId AND bu.IsIT = 0
+        AND e.[Month] IN (SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth, @Month)) 
+        AND e.FiscalYear = @FiscalYear ';
+
+     IF (@CostCenterIds IS NOT NULL)      
+     SET @CostBy_BusinessUnitYTD = @CostBy_BusinessUnitYTD + ' AND e.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+
+     IF (@CostCenterOwner IS NOT NULL)
+    SET @CostBy_BusinessUnitYTD = @CostBy_BusinessUnitYTD + ' AND e.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+
+    IF (@RegionIds IS NOT NULL)
+    SET @CostBy_BusinessUnitYTD = @CostBy_BusinessUnitYTD + ' AND e.RegionId IN (SELECT Item FROM #region_Ids)';
+
+    IF (@LocationIds IS NOT NULL)
+    SET @CostBy_BusinessUnitYTD = @CostBy_BusinessUnitYTD + ' AND e.LocationId IN (SELECT Item FROM #location_Ids)';
+
+    IF (@DepartmentIds IS NOT NULL)
+    SET @CostBy_BusinessUnitYTD = @CostBy_BusinessUnitYTD + ' AND e.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+    IF (@OfficeIds IS NOT NULL)
+    SET @CostBy_BusinessUnitYTD = @CostBy_BusinessUnitYTD + ' AND e.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+    IF (@CountryIds IS NOT NULL)
+    SET @CostBy_BusinessUnitYTD = @CostBy_BusinessUnitYTD + ' AND e.CountryId IN (SELECT Item FROM #country_Ids)';
+
+    IF (@FinanceCostCategoryIds IS NOT NULL)
+    SET @CostBy_BusinessUnitYTD = @CostBy_BusinessUnitYTD + ' AND (e.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = e.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids))';
+
+    IF (@ExpenseTypeIds IS NOT NULL)
+    SET @CostBy_BusinessUnitYTD = @CostBy_BusinessUnitYTD + ' AND e.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+ 
+    IF (@BusinessUnitIds IS NOT NULL)
+    SET @CostBy_BusinessUnitYTD = @CostBy_BusinessUnitYTD + ' AND e.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+    SET @CostBy_BusinessUnitYTD = @CostBy_BusinessUnitYTD + '
+        GROUP BY bu.Id, bu.BusinessUnitName
+        ORDER BY bu.BusinessUnitName
+        FOR JSON PATH, INCLUDE_NULL_VALUES)';
+
+    EXEC sp_executesql @CostBy_BusinessUnitYTD, N' @FiscalYear INT, @FiscalStartMonth INT, @Month INT, @CostByBusinessUnitYTD NVARCHAR(MAX) OUTPUT', @FiscalYear, @FiscalStartMonth, @Month, @CostByBusinessUnitYTD OUTPUT;
+
+	END
+	
+	-----------------------------------------------------------------------------------------------
+	-- Services/Applications Count and YTD cost
+	-----------------------------------------------------------------------------------------------
+	SET @IsDisable = (SELECT IsDisable FROM @TDashboardConfig WHERE Name = 'Services')
+	IF(@IsDisable = 0 OR (SELECT IsDisable FROM @TDashboardConfig WHERE Name = 'Applications') = 0)
+	BEGIN
+		DECLARE @TempSerType TABLE
+		(
+			Total DECIMAL(18,2),
+			[Count] INT,
+			ItPortfolioEntityType INT
+		)
+
+		INSERT INTO @TempSerType
+		--SELECT (totalAmt - internalAllocatedAmt) AS Total, /*Commented as Requested By Khalid [01-May-21]*/
+		SELECT totalAmt AS Total,
+		cnt,ItPortfolioEntityType
+		FROM(
+		SELECT ISNULL(SUM(ap.AllocatedAmount),0) AS totalAmt,
+		( SELECT ISNULL(SUM(ap1.AllocatedAmount),0)
+							FROM [AppServiceCostAllocationSchedule] ap1
+							INNER JOIN AppServiceCostContainers ascc1 ON ascc1.Id = ap1.ToServiceCostContainerId
+							INNER JOIN AppServiceCostContainers ascc2 ON ascc2.Id = ap1.FromServiceCostContainerId
+							WHERE ap1.FromServiceCostContainerId IS NOT NULL AND ap1.ToServiceCostContainerId IS NOT NULL
+								AND ascc1.ItPortfolioEntityType =ascc.ItPortfolioEntityType
+								AND  ap1.ToServiceCostContainerId <> @UnallocatedServiceId
+								AND CASE WHEN ascc.ItPortfolioEntityType = @ItPortfolioEntityType_Service THEN
+									ascc1.ItPortfolioEntityType 
+								ELSE
+									ascc2.ItPortfolioEntityType 
+								END
+								= CASE WHEN ascc.ItPortfolioEntityType = @ItPortfolioEntityType_Service THEN
+									@ItPortfolioEntityType_Service 
+								ELSE
+									@ItPortfolioEntityType_Application
+								END
+								AND 
+								(
+									ap1.MonthYear BETWEEN DATEFROMPARTS(dbo.fnGetActualYear(@FiscalStartMonth, @FiscalStartMonth, @FiscalYear),@FiscalStartMonth,1) 
+									AND EOMONTH(DATEFROMPARTS(@year,@month,1)
+								)
+								AND ascc1.ShowInDashboardsAndReports =1 
+								AND ascc2.ShowInDashboardsAndReports =1 
+							)
+		) AS internalAllocatedAmt,
+		(
+			SELECT COUNT(DISTINCT ap1.ToServiceCostContainerId)
+			FROM [AppServiceCostAllocationSchedule] ap1
+			INNER JOIN AppServiceCostContainers ascc1 ON ascc1.Id = ap1.ToServiceCostContainerId
+			WHERE ap1.ToServiceCostContainerId <> @UnallocatedServiceId AND ToServiceCostContainerId IS NOT NULL
+				AND ascc1.ItPortfolioEntityType = ascc.ItPortfolioEntityType AND ascc1.ShowInDashboardsAndReports =1 
+				AND
+				ap1.MonthYear BETWEEN DATEFROMPARTS(dbo.fnGetActualYear(@FiscalStartMonth, @FiscalStartMonth, @FiscalYear),@FiscalStartMonth,1) 
+								AND EOMONTH(DATEFROMPARTS(@year,@month,1))
+		) AS cnt,
+		ascc.ItPortfolioEntityType
+		FROM  AppServiceCostContainers ascc 
+			LEFT JOIN [AppServiceCostAllocationSchedule] ap ON ascc.Id = ap.ToServiceCostContainerId 
+				AND ap.ToServiceCostContainerId <> @UnallocatedServiceId AND ToServiceCostContainerId IS NOT NULL			
+				AND (
+						ap.MonthYear BETWEEN DATEFROMPARTS(dbo.fnGetActualYear(@FiscalStartMonth, @FiscalStartMonth, @FiscalYear),@FiscalStartMonth,1) 
+						AND EOMONTH(DATEFROMPARTS(@Year,@Month,1))
+					)
+			AND ascc.ShowInDashboardsAndReports =1 
+			GROUP BY ascc.ItPortfolioEntityType
+		) tbl
+
+		SET @ServicesData = (STUFF( (SELECT CONVERT(NVARCHAR,ISNULL(Total,0)) + ':' + CONVERT(NVARCHAR,ISNULL([Count],0))
+			FROM @TempSerType WHERE ItPortfolioEntityType = @ItPortfolioEntityType_Service FOR XML PATH ('')), 1, 0, ''))
+
+		SET @ApplicationsData = (STUFF( (SELECT CONVERT(NVARCHAR,ISNULL(Total,0)) + ':' + CONVERT(NVARCHAR,ISNULL([Count],0))
+			FROM @TempSerType WHERE ItPortfolioEntityType = @ItPortfolioEntityType_Application FOR XML PATH ('')), 1, 0, ''))
+	 
+		-----------------------------------------------------------------------------------------------
+		-- Services Projects Applications Chart data
+		-----------------------------------------------------------------------------------------------	 
+		SELECT @ServiceApplicationProjectChartData=(
+				--SELECT total - internalAllocatedAmt AS Total, /*Commented as Requested By Khalid [01-May-21]*/
+				SELECT total AS Total,
+				CONVERT(NVARCHAR, FORMAT(DATEFROMPARTS(t.[year],t.[Month],1),'MMM yyyy')) AS MonthYear,ItPortfolioEntityType FROM
+				(
+					SELECT ISNULL(SUM(ap.AllocatedAmount),0) AS total,
+					( SELECT ISNULL(SUM(ap1.AllocatedAmount),0)
+						FROM [AppServiceCostAllocationSchedule] ap1
+						INNER JOIN AppServiceCostContainers ascc1 ON ascc1.Id = ap1.ToServiceCostContainerId
+						INNER JOIN AppServiceCostContainers ascc2 ON ascc2.Id = ap1.FromServiceCostContainerId
+						WHERE ap1.FromServiceCostContainerId IS NOT NULL AND ap1.ToServiceCostContainerId IS NOT NULL
+							AND ascc1.ItPortfolioEntityType =ascc.ItPortfolioEntityType
+							AND  ap1.ToServiceCostContainerId <> @UnallocatedServiceId
+							AND CASE WHEN ascc.ItPortfolioEntityType = @ItPortfolioEntityType_Service THEN
+							ascc1.ItPortfolioEntityType 
+							ELSE
+							ascc2.ItPortfolioEntityType 
+							END
+							= CASE WHEN ascc.ItPortfolioEntityType = @ItPortfolioEntityType_Service THEN
+							@ItPortfolioEntityType_Service 
+							ELSE
+							@ItPortfolioEntityType_Application
+							END
+							--AND (
+							--ap1.MonthYear BETWEEN DATEFROMPARTS(dbo.fnGetActualYear(@FiscalStartMonth, @FiscalStartMonth, @FiscalYear),@FiscalStartMonth,1) 
+							--AND EOMONTH(DATEFROMPARTS(@year,@month,1)))
+
+							AND ap1.[Year]=ap.[Year] 
+							AND ap1.[Month]=ap.[Month]
+							AND ascc1.ShowInDashboardsAndReports =1 
+							AND ascc2.ShowInDashboardsAndReports =1 
+						
+					AND ap.[Month] IS NOT NULL 
+			) AS internalAllocatedAmt,
+			ap.[year],ap.[Month],ascc.ItPortfolioEntityType				
+			FROM  AppServiceCostContainers ascc 
+				LEFT JOIN [AppServiceCostAllocationSchedule] ap ON ascc.Id = ap.ToServiceCostContainerId 
+			WHERE ap.ToServiceCostContainerId <> @UnallocatedServiceId AND ToServiceCostContainerId IS NOT NULL					
+					AND (
+						ap.MonthYear BETWEEN DATEFROMPARTS(dbo.fnGetActualYear(@FiscalStartMonth, @FiscalStartMonth, @FiscalYear),@FiscalStartMonth,1) 
+							AND EOMONTH(DATEFROMPARTS(@year,@month,1))
+						)
+					AND ap.[Month] IS NOT NULL 
+					AND ascc.ShowInDashboardsAndReports =1 
+			GROUP BY ap.[Year],ap.[Month],ItPortfolioEntityType
+			) t ORDER BY t.[Year],t.[Month]
+			FOR JSON PATH, INCLUDE_NULL_VALUES)
+	END
+	
+	-----------------------------------------------------------------------------------------------
+	-- Projects Data
+	-----------------------------------------------------------------------------------------------
+	SET @IsDisable = (SELECT IsDisable FROM @TDashboardConfig WHERE Name = 'Projects')
+	IF(@IsDisable = 0)
+	BEGIN
+		SELECT @ProjectsData = (
+		SELECT ISNULL(SUM(sca.AllocatedAmount),0) AS Total
+		,(
+			SELECT COUNT(DISTINCT sca1.ToProjectId)
+			FROM [AppServiceCostAllocationSchedule] sca1
+			WHERE sca1.ToProjectId IS NOT NULL
+				AND sca1.MonthYear BETWEEN DATEFROMPARTS(dbo.fnGetActualYear(@FiscalStartMonth, @FiscalStartMonth, @FiscalYear), @FiscalStartMonth , 1) 
+									AND EOMONTH(DATEFROMPARTS(@Year,@Month,1))
+		) AS [Count]
+		FROM [AppServiceCostAllocationSchedule] sca
+			INNER JOIN AppProjects pj ON pj.Id = sca.ToProjectId
+		WHERE sca.ToProjectId IS NOT NULL
+			AND sca.MonthYear BETWEEN DATEFROMPARTS(dbo.fnGetActualYear(@FiscalStartMonth, @FiscalStartMonth, @FiscalYear), @FiscalStartMonth , 1) 
+									AND EOMONTH(DATEFROMPARTS(@Year,@Month,1))
+		FOR JSON PATH, INCLUDE_NULL_VALUES
+		)
+	 
+		-- Projects Data Treand
+		SELECT @ProjectsTrend = 
+			(
+				SELECT ISNULL(SUM(sca.AllocatedAmount),0) AS Total,
+					CONVERT(NVARCHAR, FORMAT(DATEFROMPARTS(sca.[year],sca.[Month],1),'MMM yyyy')) AS MonthYear
+				FROM  [AppServiceCostAllocationSchedule] sca
+				WHERE sca.ToProjectId IS NOT NULL
+						AND sca.MonthYear BETWEEN DATEFROMPARTS(dbo.fnGetActualYear(@FiscalStartMonth, @FiscalStartMonth, @FiscalYear), @FiscalStartMonth , 1) 
+												AND EOMONTH(DATEFROMPARTS(@Year,@Month,1))
+				GROUP BY sca.[Year],sca.[Month]
+				ORDER BY sca.[Year],sca.[Month]
+		FOR JSON PATH, INCLUDE_NULL_VALUES)
+	END
+	
+	-----------------------------------------------------------------------------------------------
+	--Top 5 Services Cost Chart
+	-----------------------------------------------------------------------------------------------
+	SET @IsDisable = (SELECT IsDisable FROM @TDashboardConfig WHERE Name = 'TopServicesCost')
+	IF(@IsDisable = 0)
+	BEGIN
+		DECLARE @Top5Services TABLE
+		(
+			ServiceId INT,
+			ServiceName NVARCHAR(256),
+			TotalCost DECIMAL(18,2)
+		)
+
+		INSERT INTO @Top5Services -- Consider all services not just leaf
+		SELECT TOP 5 Id ServiceId, ServiceContainerName ServiceName, TotalCost
+		FROM (
+				SELECT  ascc.Id, ISNULL(SUM(ap.AllocatedAmount),0) AS TotalCost, ascc.ServiceContainerName
+					FROM  [AppServiceCostAllocationSchedule] ap
+						INNER JOIN  AppServiceCostContainers ascc ON ascc.Id = ap.ToServiceCostContainerId 
+					WHERE ap.ToServiceCostContainerId <> @UnallocatedServiceId AND ToServiceCostContainerId IS NOT NULL
+							AND (
+								ap.MonthYear BETWEEN DATEFROMPARTS(dbo.fnGetActualYear(@FiscalStartMonth, @FiscalStartMonth, @FiscalYear),@FiscalStartMonth,1) 
+														AND EOMONTH(DATEFROMPARTS(@Year,@Month,1))
+								)
+							AND ascc.ItPortfolioEntityType=@ItPortfolioEntityType_Service
+							AND ascc.ShowInDashboardsAndReports =1 
+					GROUP BY ascc.Id, ascc.ServiceContainerName
+		) t WHERE TotalCost <> 0
+		ORDER BY TotalCost DESC
+
+		SELECT @Top5ServicesCostChart = (
+		SELECT ServiceId,[Name], TotalCost
+		FROM
+		(
+			SELECT ServiceId,ServiceName [Name], TotalCost
+			FROM @Top5Services
+
+		) t ORDER BY TotalCost DESC
+		FOR JSON PATH, INCLUDE_NULL_VALUES )
+	END
+	
+	-----------------------------------------------------------------------------------------------
+	--Top 5 Applications Cost Chart
+	-----------------------------------------------------------------------------------------------
+	SET @IsDisable = (SELECT IsDisable FROM @TDashboardConfig WHERE Name = 'TopApplicationsCost')
+	IF(@IsDisable = 0)
+	BEGIN
+		DECLARE @Top5Applications TABLE
+		(
+			ServiceId INT,
+			ServiceName NVARCHAR(256),
+			TotalCost DECIMAL(18,2)
+		)
+
+		INSERT INTO @Top5Applications -- Consider all Applications not just leaf
+		SELECT TOP 5 Id ApplicationId, ServiceContainerName ServiceName, TotalCost
+		FROM (
+				SELECT  ascc.Id, ISNULL(SUM(ap.AllocatedAmount),0) AS TotalCost, ascc.ServiceContainerName
+					FROM  [AppServiceCostAllocationSchedule] ap
+						INNER JOIN  AppServiceCostContainers ascc ON ascc.Id = ap.ToServiceCostContainerId 
+					WHERE ap.ToServiceCostContainerId <> @UnallocatedServiceId AND ToServiceCostContainerId IS NOT NULL
+							AND (
+								ap.MonthYear BETWEEN DATEFROMPARTS(dbo.fnGetActualYear(@FiscalStartMonth, @FiscalStartMonth, @FiscalYear),@FiscalStartMonth,1) 
+														AND EOMONTH(DATEFROMPARTS(@Year,@Month,1))
+								)
+							AND ascc.ItPortfolioEntityType = @ItPortfolioEntityType_Application
+							AND ascc.ShowInDashboardsAndReports =1 
+				GROUP BY ascc.Id, ascc.ServiceContainerName
+		) t WHERE TotalCost <> 0
+		ORDER BY TotalCost DESC
+
+		SELECT @Top5ApplicationsCostChart = (
+		SELECT ServiceId ApplicationId,[Name], TotalCost
+		FROM
+		(
+			SELECT ServiceId,ServiceName [Name], TotalCost
+			FROM @Top5Applications
+
+		) t ORDER BY TotalCost DESC
+		FOR JSON PATH, INCLUDE_NULL_VALUES)
+	END
+	
+	-----------------------------------------------------------------------------------------------
+	-- Top 5 Projects Cost
+	-----------------------------------------------------------------------------------------------
+	SET @IsDisable = (SELECT IsDisable FROM @TDashboardConfig WHERE Name = 'TopProjectsCost')
+	IF(@IsDisable = 0)
+	BEGIN
+		SELECT @Top5ProjectsCostChart = (
+			SELECT sca.ToProjectId ProjectId,pj.ProjectName Name,
+				( SELECT ISNULL(SUM(sca1.AllocatedAmount),0) AS Total 
+				  FROM  [AppServiceCostAllocationSchedule] sca1
+					  INNER JOIN AppProjects pj1 ON pj1.Id = sca1.ToProjectId 
+				  WHERE sca1.ToProjectId = sca.ToProjectId
+						AND sca1.MonthYear BETWEEN DATEFROMPARTS(dbo.fnGetActualYear(@FiscalStartMonth, @FiscalStartMonth, @FiscalYear), @FiscalStartMonth , 1) 
+												AND EOMONTH(DATEFROMPARTS(@Year,@Month,1))
+				  GROUP BY sca1.ToProjectId
+				)TotalCost 
+			
+ 			FROM AppServiceCostAllocationSchedule sca
+			INNER JOIN AppProjects pj ON pj.Id = sca.ToProjectId
+			WHERE sca.ToProjectId IN ( 
+						SELECT TOP 5 sca1.ToProjectId
+						FROM AppServiceCostAllocationSchedule sca1
+							INNER JOIN AppProjects pj1 ON pj1.Id = sca1.ToProjectId
+						WHERE sca1.ToProjectId IS NOT NULL
+							AND sca1.MonthYear BETWEEN DATEFROMPARTS(dbo.fnGetActualYear(@FiscalStartMonth, @FiscalStartMonth, @FiscalYear), @FiscalStartMonth , 1) 
+										AND EOMONTH(DATEFROMPARTS(@Year,@Month,1))
+							
+						GROUP BY sca1.ToProjectId
+						ORDER BY ISNULL(SUM(sca1.AllocatedAmount),0) DESC
+					)
+				AND sca.MonthYear BETWEEN DATEFROMPARTS(dbo.fnGetActualYear(@FiscalStartMonth, @FiscalStartMonth, @FiscalYear), @FiscalStartMonth , 1) 
+										AND EOMONTH(DATEFROMPARTS(@Year,@Month,1))
+			
+			GROUP BY sca.ToProjectId, pj.ProjectName
+			FOR JSON PATH, INCLUDE_NULL_VALUES
+		)
+	END
+	
+	-----------------------------------------------------------------------------------------------
+	-- Investment Distribution RGT Cost Chart
+	-----------------------------------------------------------------------------------------------
+	SET @IsDisable = (SELECT IsDisable FROM @TDashboardConfig WHERE Name = 'InvestmentDistributionRGT')
+	IF(@IsDisable = 0)
+	BEGIN
+		SELECT @ProjectCostChart = (
+			SELECT ISNULL(pj1.ProjectInvestmentType, 0) RGT, ISNULL(SUM(sca1.AllocatedAmount),0) AS TotalCost 
+				FROM  [AppServiceCostAllocationSchedule] sca1
+					INNER JOIN AppProjects pj1 ON pj1.Id = sca1.ToProjectId 
+				WHERE sca1.ToProjectId IS NOT NULL
+					AND sca1.MonthYear BETWEEN DATEFROMPARTS(dbo.fnGetActualYear(@FiscalStartMonth, @FiscalStartMonth, @FiscalYear), @FiscalStartMonth , 1) 
+									AND EOMONTH(DATEFROMPARTS(@Year,@Month,1))					
+				GROUP BY pj1.ProjectInvestmentType
+		FOR JSON PATH, INCLUDE_NULL_VALUES)
+
+		SELECT @ServiceCostChart = (
+			SELECT ISNULL(ascc.RGTCostModel, 0) RGT, ISNULL(SUM(ap.AllocatedAmount),0) AS TotalCost
+				FROM  [AppServiceCostAllocationSchedule] ap
+					INNER JOIN  AppServiceCostContainers ascc ON ascc.Id = ap.ToServiceCostContainerId 
+				WHERE ap.ToServiceCostContainerId <> @UnallocatedServiceId AND ToServiceCostContainerId IS NOT NULL
+						AND ap.MonthYear BETWEEN DATEFROMPARTS(dbo.fnGetActualYear(@FiscalStartMonth, @FiscalStartMonth, @FiscalYear), @FiscalStartMonth , 1) 
+									AND EOMONTH(DATEFROMPARTS(@Year,@Month,1))
+						AND ascc.ShowInDashboardsAndReports = 1 
+						AND ascc.ItPortfolioEntityType = @ItPortfolioEntityType_Service -- Service
+				GROUP BY RGTCostModel
+		FOR JSON PATH, INCLUDE_NULL_VALUES)
+
+		SELECT @ApplicationCostChart = (
+			SELECT ISNULL(ascc.RGTCostModel, 0) RGT, ISNULL(SUM(ap.AllocatedAmount),0) AS TotalCost
+					FROM  [AppServiceCostAllocationSchedule] ap
+						INNER JOIN  AppServiceCostContainers ascc ON ascc.Id = ap.ToServiceCostContainerId 
+					WHERE ap.ToServiceCostContainerId <> @UnallocatedServiceId AND ToServiceCostContainerId IS NOT NULL
+							AND ap.MonthYear BETWEEN DATEFROMPARTS(dbo.fnGetActualYear(@FiscalStartMonth, @FiscalStartMonth, @FiscalYear), @FiscalStartMonth , 1) 
+										AND EOMONTH(DATEFROMPARTS(@Year,@Month,1))
+							AND ascc.ShowInDashboardsAndReports = 1 
+							AND ascc.ItPortfolioEntityType = @ItPortfolioEntityType_Application -- Application
+					GROUP BY RGTCostModel
+			FOR JSON PATH, INCLUDE_NULL_VALUES)
+
+		SELECT @RGTCostChart = ('{ "Project":'+ ISNULL(@ProjectCostChart, '[]') + ', "Service":' + ISNULL(@ServiceCostChart, '[]') + ', "Application":' + ISNULL(@ApplicationCostChart,'[]') + ' }')
+	END
+	
+	-----------------------------------------------------------------------------------------------
+	--IT Cost to Plan (YTD) - Bar & Line chart
+	-----------------------------------------------------------------------------------------------		
+	SET @IsDisable = (SELECT IsDisable FROM @TDashboardConfig WHERE Name = 'ITCostToPlanFY')
+	IF(@IsDisable = 0)
+	BEGIN
+
+	    DECLARE @IT_CostToPlanFY NVARCHAR(MAX);
+		SET @IT_CostToPlanFY = ' 
+   SELECT @ITCostToPlanFY = (SELECT  Actual,Budget,Forcast,CONVERT(NVARCHAR, FORMAT(DATEFROMPARTS([Year],[month],1),''MMM yyyy'')) [MonthYear]
+			FROM
+			(
+				SELECT [month],dbo.fnGetActualYear(@FiscalStartMonth,e.month,@FiscalYear) [Year],	
+				(
+					CASE WHEN @AccountPeriod < [dbo].[fnGetAccountingPeriod](@FiscalStartMonth,e.[month]) THEN 0 ELSE 
+					(SELECT ISNULL(SUM(ExpenseAmount),0) Amount
+						FROM vw_ExpensesLight ve 
+						WHERE ve.[Month] = e.[Month]
+							AND ve.FiscalYear = @FiscalYear	 ';
+
+	IF (@CostCenterIds IS NOT NULL)      
+    SET @IT_CostToPlanFY += 'AND ve.CostCenterId IN (SELECT Item FROM #cc_Ids) ';
+
+    IF (@CostCenterOwner IS NOT NULL)
+    SET @IT_CostToPlanFY += 'AND ve.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner) ';
+ 
+   IF (@RegionIds IS NOT NULL)
+    SET @IT_CostToPlanFY += 'AND ve.RegionId IN (SELECT Item FROM #region_Ids) ';
+
+   IF (@LocationIds IS NOT NULL)
+    SET @IT_CostToPlanFY += 'AND ve.LocationId IN (SELECT Item FROM #location_Ids) ';
+
+   IF (@DepartmentIds IS NOT NULL)
+    SET @IT_CostToPlanFY += 'AND ve.DepartmentId IN (SELECT Item FROM #department_Ids) ';
+
+   IF (@OfficeIds IS NOT NULL)
+    SET @IT_CostToPlanFY += 'AND ve.OfficeId IN (SELECT Item FROM #office_Ids) ';
+
+    IF (@CountryIds IS NOT NULL)
+    SET @IT_CostToPlanFY += 'AND ve.CountryId IN (SELECT Item FROM #country_Ids) ';
+
+   IF (@FinanceCostCategoryIds IS NOT NULL)
+    SET @IT_CostToPlanFY += 'AND (ve.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = ve.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids)) ';
+
+    IF (@ExpenseTypeIds IS NOT NULL)
+    SET @IT_CostToPlanFY += 'AND ve.ExpenseType IN (SELECT Item FROM #expenseType_Ids) ';
+ 
+    IF (@BusinessUnitIds IS NOT NULL)
+    SET @IT_CostToPlanFY += 'AND ve.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids) ';
+
+
+
+	SET @IT_CostToPlanFY += '
+                ) END
+            ) Actual,
+            (
+                SELECT ISNULL(SUM(ISNULL(vbd.Amount,0)),0)
+                FROM vw_BudgetPlanDetails vbd 
+                WHERE vbd.FiscalYear = @FiscalYear 
+                AND vbd.CapExOpEx = @Enum_OpExId 
+                AND vbd.[Month] = e.[Month] ';
+
+
+	IF (@CostCenterIds IS NOT NULL)      
+     SET @IT_CostToPlanFY = @IT_CostToPlanFY + ' AND vbd.CostCenterId IN (SELECT Item FROM #cc_Ids) ';
+
+     IF (@CostCenterOwner IS NOT NULL)
+    SET @IT_CostToPlanFY = @IT_CostToPlanFY + ' AND vbd.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner) ';
+
+    IF (@RegionIds IS NOT NULL)
+    SET @IT_CostToPlanFY = @IT_CostToPlanFY + ' AND vbd.RegionId IN (SELECT Item FROM #region_Ids) ';
+
+    IF (@LocationIds IS NOT NULL)
+    SET @IT_CostToPlanFY = @IT_CostToPlanFY + ' AND vbd.LocationId IN (SELECT Item FROM #location_Ids) ';
+
+    IF (@DepartmentIds IS NOT NULL)
+    SET @IT_CostToPlanFY = @IT_CostToPlanFY + ' AND vbd.DepartmentId IN (SELECT Item FROM #department_Ids) ';
+
+    IF (@OfficeIds IS NOT NULL)
+    SET @IT_CostToPlanFY = @IT_CostToPlanFY + ' AND vbd.OfficeId IN (SELECT Item FROM #office_Ids) ';
+
+    IF (@CountryIds IS NOT NULL)
+    SET @IT_CostToPlanFY = @IT_CostToPlanFY + ' AND vbd.CountryId IN (SELECT Item FROM #country_Ids) ';
+
+    IF (@FinanceCostCategoryIds IS NOT NULL)
+    SET @IT_CostToPlanFY = @IT_CostToPlanFY + ' AND (vbd.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = vbd.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids)) ';
+
+    IF (@ExpenseTypeIds IS NOT NULL)
+    SET @IT_CostToPlanFY = @IT_CostToPlanFY + ' AND vbd.ExpenseType IN (SELECT Item FROM #expenseType_Ids) ';
+ 
+    IF (@BusinessUnitIds IS NOT NULL)
+    SET @IT_CostToPlanFY = @IT_CostToPlanFY + ' AND vbd.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids) ';
+
+					    SET @IT_CostToPlanFY += '
+            ) Budget,
+            (
+                SELECT ISNULL(SUM(ISNULL(vbd.Amount,0)),0)
+                FROM vw_BudgetForecastingDetails vbd 
+                WHERE vbd.FiscalYear = @FiscalYear 
+                AND vbd.CapExOpEx = @Enum_OpExId 
+                AND vbd.[Month] = e.[Month]
+                AND vbd.ForecastingId = @ForcastId ';
+
+	IF (@CostCenterIds IS NOT NULL)       
+     SET @IT_CostToPlanFY = @IT_CostToPlanFY + ' AND vbd.CostCenterId IN (SELECT Item FROM #cc_Ids) ';
+
+     IF (@CostCenterOwner IS NOT NULL)
+    SET @IT_CostToPlanFY = @IT_CostToPlanFY + ' AND vbd.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner) ';
+
+    IF (@RegionIds IS NOT NULL)
+    SET @IT_CostToPlanFY = @IT_CostToPlanFY + ' AND vbd.RegionId IN (SELECT Item FROM #region_Ids) ';
+
+    IF (@LocationIds IS NOT NULL)
+    SET @IT_CostToPlanFY = @IT_CostToPlanFY + ' AND vbd.LocationId IN (SELECT Item FROM #location_Ids) ';
+
+    IF (@DepartmentIds IS NOT NULL)
+    SET @IT_CostToPlanFY = @IT_CostToPlanFY + ' AND vbd.DepartmentId IN (SELECT Item FROM #department_Ids) ';
+
+    IF (@OfficeIds IS NOT NULL)
+    SET @IT_CostToPlanFY = @IT_CostToPlanFY + ' AND vbd.OfficeId IN (SELECT Item FROM #office_Ids) ';
+
+    IF (@CountryIds IS NOT NULL)
+    SET @IT_CostToPlanFY = @IT_CostToPlanFY + ' AND vbd.CountryId IN (SELECT Item FROM #country_Ids) ';
+
+    IF (@FinanceCostCategoryIds IS NOT NULL)
+    SET @IT_CostToPlanFY = @IT_CostToPlanFY + ' AND (vbd.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = vbd.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids))';
+
+    IF (@ExpenseTypeIds IS NOT NULL)
+    SET @IT_CostToPlanFY = @IT_CostToPlanFY + ' AND vbd.ExpenseType IN (SELECT Item FROM #expenseType_Ids) ';
+
+    SET @IT_CostToPlanFY += '
+            ) Forcast	
+				FROM (SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth,@FiscalEndMonth)) e
+				GROUP BY dbo.fnGetActualYear(@FiscalStartMonth,e.month,@FiscalYear),[month]
+			) t 
+			ORDER BY [Year],[month]
+		FOR JSON PATH, INCLUDE_NULL_VALUES)';
+
+		    EXEC sp_executesql @IT_CostToPlanFY, N' @FiscalYear INT,@AccountPeriod int , @Enum_OpExId Int  ,  @FiscalEndMonth int  , @ForcastId int ,  @FiscalStartMonth INT, @Month INT, @ITCostToPlanFY NVARCHAR(MAX) OUTPUT', @FiscalYear,@AccountPeriod ,@Enum_OpExId , @FiscalEndMonth , @ForcastId , @FiscalStartMonth, @Month, @ITCostToPlanFY OUTPUT;
+	END
+	
+	-----------------------------------------------------------------------------------------------
+	--IT Cost Waterfall (OpEx and CapEx) Waterfall chart
+	-----------------------------------------------------------------------------------------------		
+	SET @IsDisable = (SELECT IsDisable FROM @TDashboardConfig WHERE Name = 'ITCostWaterfall')
+	IF(@IsDisable = 0)
+	BEGIN
+		IF(@IsBudget = 1)
+		BEGIN
+		        DECLARE @Cost_Waterfall NVARCHAR(MAX);
+			    set @Cost_Waterfall  =  'INSERT INTO #TempCostWaterfall
+				SELECT ''FY Plan'',ISNULL(SUM(ISNULL(vbd.Amount,0)),0)
+				FROM vw_BudgetPlanDetails vbd 
+				WHERE vbd.FiscalYear = @FiscalYear'
+
+				IF (@CostCenterIds IS NOT NULL)      
+                SET @Cost_Waterfall = @Cost_Waterfall + ' AND vbd.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+
+                IF (@CostCenterOwner IS NOT NULL)
+                SET @Cost_Waterfall = @Cost_Waterfall + ' AND vbd.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+
+                 IF (@RegionIds IS NOT NULL)
+                 SET @Cost_Waterfall = @Cost_Waterfall + ' AND vbd.RegionId IN (SELECT Item FROM #region_Ids)';
+
+                 IF (@LocationIds IS NOT NULL)
+                 SET @Cost_Waterfall = @Cost_Waterfall + ' AND vbd.LocationId IN (SELECT Item FROM #location_Ids)';
+
+                 IF (@DepartmentIds IS NOT NULL)
+                 SET @Cost_Waterfall = @Cost_Waterfall + ' AND vbd.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+                 IF (@OfficeIds IS NOT NULL)
+                  SET @Cost_Waterfall = @Cost_Waterfall + ' AND vbd.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+                  IF (@CountryIds IS NOT NULL)
+                  SET @Cost_Waterfall = @Cost_Waterfall + ' AND vbd.CountryId IN (SELECT Item FROM #country_Ids)';
+
+                  IF (@FinanceCostCategoryIds IS NOT NULL)
+                  SET @Cost_Waterfall = @Cost_Waterfall + ' AND (vbd.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = vbd.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids))';
+
+                   IF (@ExpenseTypeIds IS NOT NULL)
+                    SET @Cost_Waterfall = @Cost_Waterfall + ' AND vbd.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+ 
+                   IF (@BusinessUnitIds IS NOT NULL)
+                   SET @Cost_Waterfall = @Cost_Waterfall + ' AND vbd.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+		END
+		ELSE
+		BEGIN
+
+		        set @Cost_Waterfall  = 'INSERT INTO #TempCostWaterfall
+				SELECT ''FY Plan'',ISNULL(SUM(ISNULL(vbd.Amount,0)),0)
+				FROM vw_BudgetForecastingDetails vbd 
+				WHERE vbd.FiscalYear = @FiscalYear'
+
+				 IF (@CostCenterIds IS NOT NULL)      
+                     SET @Cost_Waterfall = @Cost_Waterfall + ' AND vbd.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+
+                     IF (@CostCenterOwner IS NOT NULL)
+                     SET @Cost_Waterfall = @Cost_Waterfall + ' AND vbd.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+
+                     IF (@RegionIds IS NOT NULL)
+                     SET @Cost_Waterfall = @Cost_Waterfall + ' AND vbd.RegionId IN (SELECT Item FROM #region_Ids)';
+
+                     IF (@LocationIds IS NOT NULL)
+                     SET @Cost_Waterfall = @Cost_Waterfall + ' AND vbd.LocationId IN (SELECT Item FROM #location_Ids)';
+
+                     IF (@DepartmentIds IS NOT NULL)
+                     SET @Cost_Waterfall = @Cost_Waterfall + ' AND vbd.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+                     IF (@OfficeIds IS NOT NULL)
+                     SET @Cost_Waterfall = @Cost_Waterfall + ' AND vbd.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+                     IF (@CountryIds IS NOT NULL)
+                     SET @Cost_Waterfall = @Cost_Waterfall + ' AND vbd.CountryId IN (SELECT Item FROM #country_Ids)';
+
+                      IF (@FinanceCostCategoryIds IS NOT NULL)
+                      SET @Cost_Waterfall = @Cost_Waterfall + ' AND vbd.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = vbd.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids)';
+  
+                      IF (@ExpenseTypeIds IS NOT NULL)
+                      SET @Cost_Waterfall = @Cost_Waterfall + ' AND vbd.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+			    	IF (@CostCenterVersionIds IS NOT NULL)
+                    SET @Cost_Waterfall = @Cost_Waterfall + ' ( (NULLIF(@CostCenterVersionIds, '') IS NULL AND vbd.IsLatestVersion = 1)
+                    OR (NULLIF(@CostCenterVersionIds, '') IS NOT NULL AND vbd.ForecastingCostCenterId IN (SELECT Item FROM #costCenterVersion_Ids)))';
+
+		END
+
+   
+          SET @Cost_Waterfall = ' 
+    INSERT INTO #TempCostWaterfall
+    SELECT FORMAT(DATEFROMPARTS([Year], [month], 1), ''MMM yyyy'') AS MonthYear, Amount
+    FROM (
+        SELECT ISNULL(SUM(tt.Amount), 0) AS Amount, tt.[Year], tt.[month] 
+        FROM (
+            SELECT (ISNULL(SUM(ExpenseAmount), 0) * -1) AS Amount, [Year], [month]
+            FROM vw_ExpensesLight ve 
+            WHERE ve.[Month] IN (SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth, @Month)) 
+                AND ve.FiscalYear = @FiscalYear';
+
+IF (@CostCenterIds IS NOT NULL)      
+    SET @Cost_Waterfall = @Cost_Waterfall + ' AND ve.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+
+IF (@CostCenterOwner IS NOT NULL)
+    SET @Cost_Waterfall = @Cost_Waterfall + ' AND ve.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+
+IF (@RegionIds IS NOT NULL)
+    SET @Cost_Waterfall = @Cost_Waterfall + ' AND ve.RegionId IN (SELECT Item FROM #region_Ids)';
+
+IF (@LocationIds IS NOT NULL)
+    SET @Cost_Waterfall = @Cost_Waterfall + ' AND ve.LocationId IN (SELECT Item FROM #location_Ids)';
+
+IF (@DepartmentIds IS NOT NULL)
+    SET @Cost_Waterfall = @Cost_Waterfall + ' AND ve.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+IF (@OfficeIds IS NOT NULL)
+    SET @Cost_Waterfall = @Cost_Waterfall + ' AND ve.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+IF (@CountryIds IS NOT NULL)
+    SET @Cost_Waterfall = @Cost_Waterfall + ' AND ve.CountryId IN (SELECT Item FROM #country_Ids)';
+
+IF (@FinanceCostCategoryIds IS NOT NULL)
+    SET @Cost_Waterfall = @Cost_Waterfall + ' AND (ve.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = ve.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids))';
+
+IF (@ExpenseTypeIds IS NOT NULL)
+    SET @Cost_Waterfall = @Cost_Waterfall + ' AND ve.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+IF (@BusinessUnitIds IS NOT NULL)
+    SET @Cost_Waterfall = @Cost_Waterfall + ' AND ve.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+SET @Cost_Waterfall = @Cost_Waterfall + '
+        GROUP BY [Year], [month] 
+        UNION ALL 
+        SELECT (ISNULL(SUM(Amount), 0) * -1) AS Amount, [Year], [month]
+        FROM vw_CapExLight ve 
+        WHERE ve.[Month] IN (SELECT [month] FROM dbo.fnGetMonthList(@FiscalStartMonth, @Month)) 
+            AND ve.FiscalYear = @FiscalYear';
+
+IF (@CostCenterIds IS NOT NULL)      
+    SET @Cost_Waterfall = @Cost_Waterfall + ' AND ve.CostCenterId IN (SELECT Item FROM #cc_Ids)';
+
+IF (@CostCenterOwner IS NOT NULL)
+    SET @Cost_Waterfall = @Cost_Waterfall + ' AND ve.CostCenterCCOwner IN (SELECT Item FROM #cc_Owner)';
+
+IF (@RegionIds IS NOT NULL)
+    SET @Cost_Waterfall = @Cost_Waterfall + ' AND ve.RegionId IN (SELECT Item FROM #region_Ids)';
+
+IF (@LocationIds IS NOT NULL)
+    SET @Cost_Waterfall = @Cost_Waterfall + ' AND ve.LocationId IN (SELECT Item FROM #location_Ids)';
+
+IF (@DepartmentIds IS NOT NULL)
+    SET @Cost_Waterfall = @Cost_Waterfall + ' AND ve.DepartmentId IN (SELECT Item FROM #department_Ids)';
+
+IF (@OfficeIds IS NOT NULL)
+    SET @Cost_Waterfall = @Cost_Waterfall + ' AND ve.OfficeId IN (SELECT Item FROM #office_Ids)';
+
+IF (@CountryIds IS NOT NULL)
+    SET @Cost_Waterfall = @Cost_Waterfall + ' AND ve.CountryId IN (SELECT Item FROM #country_Ids)';
+
+IF (@FinanceCostCategoryIds IS NOT NULL)
+    SET @Cost_Waterfall = @Cost_Waterfall + ' AND (ve.FinanceCategoryId IN (SELECT Item FROM #financeCostCategory_Ids) OR (SELECT ParentId FROM vw_CostCategories WHERE Id = ve.FinanceCategoryId) IN (SELECT Item FROM #financeCostCategory_Ids))';
+
+IF (@ExpenseTypeIds IS NOT NULL)
+    SET @Cost_Waterfall = @Cost_Waterfall + ' AND ve.ExpenseType IN (SELECT Item FROM #expenseType_Ids)';
+
+IF (@BusinessUnitIds IS NOT NULL)
+    SET @Cost_Waterfall = @Cost_Waterfall + ' AND ve.BusinessUnitId IN (SELECT Item FROM #businessUnit_Ids)';
+
+SET @Cost_Waterfall = @Cost_Waterfall + '
+        GROUP BY [Year], [month] 		
+    ) tt 
+    GROUP BY tt.[Year], tt.[month]
+) t 
+ORDER BY [Year], [month]';
+
+
+         EXEC sp_executesql @Cost_Waterfall, N' @FiscalYear INT,@FiscalStartMonth int  , @Month int    OUTPUT', @FiscalYear,@FiscalStartMonth ,@Month  OUTPUT;
+
+
+		SELECT @ITCostWaterfall = (SELECT  MonthYear,Amount FROM #TempCostWaterfall WHERE Amount <> 0 OR (MonthYear IN ('FY Plan','FY Budget'))
+		FOR JSON PATH, INCLUDE_NULL_VALUES)
+	END
+
+	INSERT INTO @TempOverview (ITCost, ITCostYTD, ITCostCapEx, ITCostCapExYTD, ITBudgetOpExYTD, ITBudgetCapExYTD, LaborITCostPctYTD, VendorsITCostPctYTD, ITSpend, ITRevenue, ITSpendVRevenue, ITSpendRevenueChart, CapExOpEx, ITCostToPlan,
+		Top10CostCenterOpEx, CostByBusinessUnitYTD, ServicesData, ProjectsData, ApplicationsData, ServiceApplicationProjectChartData, ProjectsTrend, Top5ServicesCostChart, Top5ApplicationsCostChart, Top5ProjectsCostChart, RGTCostChart, ITCostToPlanFY,
+		ITCostWaterfall, LaborOpExITCostYTD, LaborOpExYTD,ITBudgetOpEx,ITBudgetCapEx,ITVarianceOpExYTD,ITVarianceOpExYTDPct ,ITVarianceOpExYTDEffect ,ITVarianceCapExYTD ,ITVarianceCapExYTDPct ,ITVarianceCapExYTDEffect ) 
+	VALUES (@ITCost, @ITCostYTD, @ITCostCapEx, @ITCostCapExYTD, @ITBudgetOpExYTD, @ITBudgetCapExYTD, @LaborITCostPctYTD, @VendorsITCostPctYTD, @ITSpend, @ITRevenue, @ITSpendVRevenue, @ITSpendRevenueChart, @CapExOpEx, @ITCostToPlan,
+		@Top10CostCenterOpEx, @CostByBusinessUnitYTD, @ServicesData, @ProjectsData, @ApplicationsData, @ServiceApplicationProjectChartData, @ProjectsTrend, @Top5ServicesCostChart, @Top5ApplicationsCostChart, @Top5ProjectsCostChart, @RGTCostChart, @ITCostToPlanFY,
+		@ITCostWaterfall, @LaborOpExITCostYTD, @LaborOpExYTD,@ITBudgetOpEx,@ITBudgetCapEx,@ITVarianceOpExYTD ,@ITVarianceOpExYTDPct ,@ITVarianceOpExYTDEffect ,@ITVarianceCapExYTD ,@ITVarianceCapExYTDPct ,@ITVarianceCapExYTDEffect )
+
+	SELECT * FROM @TempOverview
+
+END
